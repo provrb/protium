@@ -1,41 +1,69 @@
 use bitvec::prelude::*;
 
-/// The generator polynomial constant used for CRC checksum 
+/// The generator polynomial constant used for CRC-15 (used by CAN) checksum
 /// as the divisor to generate a checksum for the provided input data.
-/// 
+///
 /// All checksum logic must use this in their checksum process.
 pub const CRC_15_GENERATOR_POLYNOMIAL: u16 = 0b0100010110011001;
 
-/// Represents a CAN ID
+#[repr(u32)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum CanId {
-    /// 11-bit standard CAN ID
+    /// 11-bit standard CAN ID.
     Standard(u16),
-    /// 29-bit extended CAN ID
+    /// 29-bit extended CAN ID.
     /// consists of 11-bit base id combined with an 18-bit extended id
     Extended(u32),
-    /// Contains the 11-bit and 18-bit IDs used
-    /// to create a 29-bit extended CAN ID
-    ExtendedSplit(u16, u32)
+}
+
+/// Contains the 11-bit and 18-bit IDs used
+/// to create a 29-bit extended CAN ID
+pub(crate) struct ExtendedIdSplit {
+    base_11_id: u16,
+    ext_18_id: u32,
 }
 
 impl CanId {
-    pub fn split_extended_id(&self) -> Result<CanId, ()> {
+    /// Validates a CAN ID and ensures it cannot be greater than
+    /// the maximum conceptual size.
+    ///
+    /// Specifically; ensures an 11-bit CAN ID cannot be greater than 0x7FF and
+    /// an 18-bit CAN ID cannot be greater than 0x1FFFFFFF.
+    pub fn validate(&self) -> Result<(), FrameError> {
+        match *self {
+            CanId::Standard(std_id) => {
+                if std_id > 0x7FF {
+                    return Err(FrameError::InvalidCANId);
+                }
+            }
+            CanId::Extended(ext_id) => {
+                if ext_id > 0x1FFFFFFF {
+                    return Err(FrameError::InvalidCANId);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Splits an extended, 29-bit CAN ID into its components:
+    /// 11-bit CAN ID and an 18-bit CAN ID
+    ///
+    /// Throws a `FrameError::InvalidCANId` error if the CanId the method is ran on
+    /// is not an extended CAN ID.
+    pub(crate) fn split_extended_id(&self) -> Result<ExtendedIdSplit, FrameError> {
         match *self {
             Self::Extended(id) => {
                 let base_11: u16 = ((id >> 18) & 0x7FF) as u16; // bits 28..18
-                let ext_18: u32 = id & 0x3FFFF;                 // bits 17..0
+                let ext_18: u32 = id & 0x3FFFF; // bits 17..0
 
-                Ok(Self::ExtendedSplit(base_11, ext_18))
-            },
-            _ => Err(())
+                Ok(ExtendedIdSplit {
+                    base_11_id: base_11,
+                    ext_18_id: ext_18,
+                })
+            }
+            _ => Err(FrameError::InvalidCANId),
         }
-    }
-}
-
-impl Default for CanId {
-    fn default() -> Self {
-        CanId::Standard(0)
     }
 }
 
@@ -45,17 +73,11 @@ pub struct FieldSpan {
     pub len: usize,
 }
 
-impl FieldSpan {
-    pub fn end(&self) -> usize {
-        self.start + self.len
-    }
-}
-
 /// Represents an Encoded CAN frame. (Unstuffed)
-/// 
+///
 /// This struct is compatible with both 11-bit CAN ID frames and
 /// 29-bit extended CAN ID frames.
-/// 
+///
 /// The encoded message is stored as a bit vector. The frame includes field spans
 /// that detail where a component of the message starts and it's size. For example,
 /// the data field. `data_field` contains the index in `bits` where it starts at, and the size of
@@ -68,7 +90,7 @@ pub struct EncodedFrame {
     ///
     /// For extended 29-bit CAN frames:
     /// 11-bit CAN ID | SRR bit | IDE bit | 18-bit CAN ID | RTR bit
-    pub arbitration_field: FieldSpan, 
+    pub arbitration_field: FieldSpan,
     /// For standard CAN frames:
     /// IDE bit | Reserved R0 bit | Data Length Code (DLC)
     ///
@@ -80,32 +102,22 @@ pub struct EncodedFrame {
     /// Checksum (size varies based on CAN version) | CRC delimeter bit (always 1)
     pub crc_field: FieldSpan,
     pub acknowledgement_field: FieldSpan, // ACK slot bit | ACK delimeter
-    pub end_of_frame_field: FieldSpan, // 7 recessive (1) bits at the end of the frame
+    pub end_of_frame_field: FieldSpan,    // 7 recessive (1) bits at the end of the frame
 }
 
 /// Represents a human friendly CAN frame.
-/// 
+///
 /// Rather than just being bits, this struct seperates parts of a CAN
 /// frame into accessible fields. Recessive and dominant bits like the ACK slot,
 /// SOF delimeter, and unnecessary things like the IDE are not included in this struct
 /// and are only present in EncodedFrame's.
 #[derive(Debug)]
 pub struct Frame {
-    pub can_id: CanId,
-    pub arbitration_field: ArbitrationField,
-    pub payload: Vec<u8>,
+    can_id: CanId,
+    payload: Vec<u8>,
+    is_remote_request: bool,
     /// Classical CAN only
-    pub checksum: u16, 
-}
-
-#[derive(Debug, Default)]
-pub struct ArbitrationField {
-    standard_can_id: CanId,
-    rtr_bit: bool,
-
-    srr_bit: Option<bool>,
-    extended_can_id: Option<CanId>,
-    ide_bit: Option<bool>,
+    checksum: u16,
 }
 
 #[derive(Debug)]
@@ -115,73 +127,126 @@ pub enum FrameError {
 }
 
 impl Frame {
+    /// Create a new frame with payload data `payload`
+    ///
+    /// Automatically calculates the checksum for the CAN frame and saves it.
     pub fn new(
         can_id: CanId,
-        is_remote_request: bool,
         payload: Vec<u8>,
+        is_remote_request: bool,
     ) -> Result<Self, FrameError> {
+        can_id.validate()?;
+
         let mut frame = Frame {
-            can_id: can_id,
-            arbitration_field: ArbitrationField::default(),
-            payload: payload,
-            checksum: 0
+            can_id,
+            payload,
+            is_remote_request,
+            checksum: 0,
         };
 
-        match can_id {
-            CanId::Standard(_) => {
-                frame.arbitration_field = ArbitrationField { 
-                    standard_can_id: can_id, 
-                    rtr_bit: is_remote_request,
-                    srr_bit: None, 
-                    extended_can_id: None, 
-                    ide_bit: None
-                }
-            },
-            CanId::Extended(_) => {
-                let CanId::ExtendedSplit(
-                    base_11_id, 
-                    ext_18_id
-                ) = can_id.split_extended_id().map_err(|_| FrameError::InvalidCANId)? else {
-                    unreachable!()
-                };
-                
-                frame.arbitration_field = ArbitrationField { 
-                    standard_can_id: CanId::Standard(base_11_id), 
-                    rtr_bit: is_remote_request,
-                    srr_bit: Some(true), 
-                    extended_can_id: Some(CanId::Extended(ext_18_id)), 
-                    ide_bit: Some(true)
-                }
-            },
-            _ => return Err(FrameError::InvalidCANId)
-        };
+        frame.checksum = frame.calculate_checksum()?;
 
         Ok(frame)
     }
 
-    pub fn get_arbitration_field(&self) {
+    /// Create a new frame with payload data `payload` and a checksum.
+    ///
+    /// Checks the provided checksum against the calculated checksum from
+    /// provided data. Throws an error if the two do not match.
+    pub fn new_with_checksum(
+        can_id: CanId,
+        payload: Vec<u8>,
+        is_remote_request: bool,
+        provided_checksum: u16,
+    ) -> Result<Self, FrameError> {
+        can_id.validate()?;
+
+        let frame = Frame {
+            can_id,
+            payload,
+            is_remote_request,
+            checksum: provided_checksum,
+        };
+
+        let calculated_checksum = frame.calculate_checksum()?;
+        if calculated_checksum != provided_checksum {
+            return Err(FrameError::InvalidChecksum);
+        }
+
+        Ok(frame)
+    }
+
+    pub fn calculate_checksum(&self) -> Result<u16, FrameError> {
+        // checksum = input data (as a binary stream) % generator constant
+        let input_data = self.create_checksum_input_stream()?;
+        let mut crc = 0;
+        for bit in &input_data {
+            let feedback = ((crc >> 14) & 1) ^ (*bit as u16);
+
+            crc <<= 1;
+            crc &= 0x7fff;
+
+            if feedback != 0 {
+                crc ^= CRC_15_GENERATOR_POLYNOMIAL;
+            }
+        }
+
+        let checksum = crc;
+        Ok(checksum)
+    }
+
+    pub fn encode(&self) -> Result<EncodedFrame, FrameError> {
         todo!()
     }
 
-    pub fn generate_checksum(&mut self) {
-        // checksum = input data (as a binary stream) % generator constant
-        // input data = SOF | Arbitration field | Control field | Data field
+    /// Create a binary stream of input data for the checksum to compute with.
+    ///
+    /// The checksum binary input data consists of:
+    /// SOF bit (always 0) | Arbitration field | Control field | Data field
+    fn create_checksum_input_stream(&self) -> Result<BitVec<u8, Msb0>, FrameError> {
+        fn push_n_bits(dst: &mut BitVec<u8, Msb0>, value: u32, nbits: usize) {
+            debug_assert!(nbits <= 32);
+            for i in (0..nbits).rev() {
+                dst.push(((value >> i) & 1) != 0);
+            }
+        }
 
-        let input_data = BitVec::<u8, Msb0>::from_slice(
-           &self.payload
-        );
+        fn push_byte(dst: &mut BitVec<u8, Msb0>, byte: u8) {
+            push_n_bits(dst, byte as u32, 8);
+        }
 
-        // append 15 zero bits
+        // input data = [1 | xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx (32 bits) | xxxx xx (6 bits) | (up to 64 bits)]
+        // convert input data into binary stream
+        let mut input_data = BitVec::<u8, Msb0>::new();
+        input_data.push(false); // SOF bit (always 0)
 
-    }
+        // Arbitration field
+        match self.can_id {
+            CanId::Standard(base_11_id) => {
+                push_n_bits(&mut input_data, base_11_id as u32, 11);
+                input_data.push(self.is_remote_request); // Remote transmission request RTR bit
+            }
+            CanId::Extended(_) => {
+                let extended_id_split = self.can_id.split_extended_id()?;
 
-    pub fn encode(&self) -> Option<EncodedFrame> {
-        None
-    }
-}
+                push_n_bits(&mut input_data, extended_id_split.base_11_id as u32, 11);
+                input_data.push(true); // SRR bit, always 1
+                input_data.push(true); // Idetifier extension bit (IDE), always 1 for ext frame
+                push_n_bits(&mut input_data, extended_id_split.ext_18_id, 18);
+                input_data.push(self.is_remote_request); // Remote transmission request RTR bit
+            }
+        }
 
-impl EncodedFrame {
-    pub fn from_bits(bits: &BitVec<u8, Msb0>) -> Option<Self> {
-        None
+        // Control field
+        input_data.push(false); // IDE bit OR r1 bit that is always 0
+        input_data.push(false); // r0 bit
+        push_n_bits(&mut input_data, self.payload.len() as u32, 4); // Data length code
+
+        // Data field
+        for byte in &self.payload {
+            push_byte(&mut input_data, *byte);
+        }
+
+        Ok(input_data)
     }
 }
