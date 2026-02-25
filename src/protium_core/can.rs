@@ -4,7 +4,7 @@ use bitvec::prelude::*;
 /// as the divisor to generate a checksum for the provided input data.
 ///
 /// All checksum logic must use this in their checksum process.
-pub const CRC_15_GENERATOR_POLYNOMIAL: u16 = 0b0100010110011001;
+const CRC_15_GENERATOR_POLYNOMIAL: u16 = 0b0100010110011001;
 
 #[repr(u32)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -29,16 +29,16 @@ impl CanId {
     ///
     /// Specifically; ensures an 11-bit CAN ID cannot be greater than 0x7FF and
     /// an 18-bit CAN ID cannot be greater than 0x1FFFFFFF.
-    pub fn validate(&self) -> Result<(), FrameError> {
+    pub fn validate(&self) -> Result<(), ProtiumFrameError> {
         match *self {
             CanId::Standard(std_id) => {
                 if std_id > 0x7FF {
-                    return Err(FrameError::InvalidCANId);
+                    return Err(ProtiumFrameError::InvalidCANId);
                 }
             }
             CanId::Extended(ext_id) => {
                 if ext_id > 0x1FFFFFFF {
-                    return Err(FrameError::InvalidCANId);
+                    return Err(ProtiumFrameError::InvalidCANId);
                 }
             }
         }
@@ -51,7 +51,7 @@ impl CanId {
     ///
     /// Throws a `FrameError::InvalidCANId` error if the CanId the method is ran on
     /// is not an extended CAN ID.
-    pub(crate) fn split_extended_id(&self) -> Result<ExtendedIdSplit, FrameError> {
+    pub(crate) fn split_extended_id(&self) -> Result<ExtendedIdSplit, ProtiumFrameError> {
         match *self {
             Self::Extended(id) => {
                 let base_11: u16 = ((id >> 18) & 0x7FF) as u16; // bits 28..18
@@ -62,7 +62,7 @@ impl CanId {
                     ext_18_id: ext_18,
                 })
             }
-            _ => Err(FrameError::InvalidCANId),
+            _ => Err(ProtiumFrameError::InvalidCANId),
         }
     }
 }
@@ -110,18 +110,21 @@ pub struct EncodedFrame {
 /// Rather than just being bits, this struct seperates parts of a CAN
 /// frame into accessible fields. Recessive and dominant bits like the ACK slot,
 /// SOF delimeter, and unnecessary things like the IDE are not included in this struct
-/// and are only present in EncodedFrame's.
+/// and are only present in `EncodedFrame`'s.
 #[derive(Debug)]
 pub struct Frame {
     can_id: CanId,
     payload: Vec<u8>,
     is_remote_request: bool,
-    /// Classical CAN only
-    checksum: u16,
 }
 
+/// An API error that is not to be confused with any technical error
+/// regarding the wire.
+///
+/// Used in Results to determine the outcome of a `Frame` API call, like
+/// `Frame::calculate_checksum()``
 #[derive(Debug)]
-pub enum FrameError {
+pub enum ProtiumFrameError {
     InvalidChecksum,
     InvalidCANId,
 }
@@ -134,49 +137,19 @@ impl Frame {
         can_id: CanId,
         payload: Vec<u8>,
         is_remote_request: bool,
-    ) -> Result<Self, FrameError> {
-        can_id.validate()?;
-
-        let mut frame = Frame {
-            can_id,
-            payload,
-            is_remote_request,
-            checksum: 0,
-        };
-
-        frame.checksum = frame.calculate_checksum()?;
-
-        Ok(frame)
-    }
-
-    /// Create a new frame with payload data `payload` and a checksum.
-    ///
-    /// Checks the provided checksum against the calculated checksum from
-    /// provided data. Throws an error if the two do not match.
-    pub fn new_with_checksum(
-        can_id: CanId,
-        payload: Vec<u8>,
-        is_remote_request: bool,
-        provided_checksum: u16,
-    ) -> Result<Self, FrameError> {
+    ) -> Result<Self, ProtiumFrameError> {
         can_id.validate()?;
 
         let frame = Frame {
             can_id,
             payload,
             is_remote_request,
-            checksum: provided_checksum,
         };
-
-        let calculated_checksum = frame.calculate_checksum()?;
-        if calculated_checksum != provided_checksum {
-            return Err(FrameError::InvalidChecksum);
-        }
 
         Ok(frame)
     }
 
-    pub fn calculate_checksum(&self) -> Result<u16, FrameError> {
+    pub fn calculate_checksum(&self) -> Result<u16, ProtiumFrameError> {
         // checksum = input data (as a binary stream) % generator constant
         let input_data = self.create_checksum_input_stream()?;
         let mut crc = 0;
@@ -195,7 +168,7 @@ impl Frame {
         Ok(checksum)
     }
 
-    pub fn encode(&self) -> Result<EncodedFrame, FrameError> {
+    pub fn encode(&self) -> Result<EncodedFrame, ProtiumFrameError> {
         todo!()
     }
 
@@ -203,7 +176,7 @@ impl Frame {
     ///
     /// The checksum binary input data consists of:
     /// SOF bit (always 0) | Arbitration field | Control field | Data field
-    fn create_checksum_input_stream(&self) -> Result<BitVec<u8, Msb0>, FrameError> {
+    fn create_checksum_input_stream(&self) -> Result<BitVec<u8, Msb0>, ProtiumFrameError> {
         fn push_n_bits(dst: &mut BitVec<u8, Msb0>, value: u32, nbits: usize) {
             debug_assert!(nbits <= 32);
             for i in (0..nbits).rev() {

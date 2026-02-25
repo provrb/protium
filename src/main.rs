@@ -1,4 +1,4 @@
-use protium::{CanId, Frame};
+use protium::can::{CanId, Frame};
 
 fn main() {
     let can_id = CanId::Standard(0x7EF);

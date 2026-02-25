@@ -7,7 +7,7 @@ pub use protium_core::*;
 /// Unit tests
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::protium_core::can::*;
 
     #[test]
     fn checksum() -> Result<(), String> {
@@ -25,9 +25,8 @@ mod tests {
         let calculated_checksum = frame.calculate_checksum().unwrap_or(0);
         if calculated_checksum != EXPECTED_CHECKSUM_RESULT {
             Err(format!(
-                "wrong checksum result for frame - expected: `{:#02x}` received: `{:#02x}`", 
-                EXPECTED_CHECKSUM_RESULT, 
-                calculated_checksum
+                "wrong checksum result for frame - expected: `{:#02x}` received: `{:#02x}`",
+                EXPECTED_CHECKSUM_RESULT, calculated_checksum
             ))
         } else {
             Ok(())
