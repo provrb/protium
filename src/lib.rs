@@ -12,7 +12,7 @@ mod tests {
     #[test]
     fn checksum() -> Result<(), String> {
         const EXPECTED_CHECKSUM_RESULT: u16 = 0x342f;
-
+        
         let can_id = CanId::Standard(0x7EF);
         let payload = vec![0x6c, 0x6c, 0x6f];
         let Ok(frame) = Frame::new(can_id, payload.clone(), false) else {
@@ -22,7 +22,7 @@ mod tests {
             )
         };
 
-        let calculated_checksum = frame.calculate_checksum().unwrap_or(0);
+        let calculated_checksum = frame.checksum().unwrap_or(0);
         if calculated_checksum != EXPECTED_CHECKSUM_RESULT {
             Err(format!(
                 "wrong checksum result for frame - expected: `{:#02x}` received: `{:#02x}`",

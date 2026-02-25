@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use bitvec::prelude::*;
 
 /// The generator polynomial constant used for CRC-15 (used by CAN) checksum
@@ -5,6 +7,38 @@ use bitvec::prelude::*;
 ///
 /// All checksum logic must use this in their checksum process.
 const CRC_15_GENERATOR_POLYNOMIAL: u16 = 0b0100010110011001;
+
+/// The position/index of the bit in an encoded CAN Frame bitsream that determines
+/// if the CAN Frame is a 29-bit CAN ID frame or 11-bit CAN ID Frame
+const IDENTIFIER_EXTENSION_BIT_IDX: usize = 13;
+
+/// Minimum valid size of an unstuffed 11-bit CAN ID frame in bits
+/// 44 bits (0 byte data field)
+pub const MIN_STANDARD_FRAME_SIZE_BITS: usize = 44;
+/// Maximum valid size of an unstuffed 11-bit CAN ID frame in bits
+/// 108 bits (8 byte (max for classical CAN) data field)
+pub const MAX_STANDARD_FRAME_SIZE_BITS: usize = 108;
+/// Range of the valid size an 11-bit standard unstuffed CAN frame can be in bits.
+pub const VALID_STANDARD_FRAME_SIZE_BITS: Range<usize> = 
+    MIN_STANDARD_FRAME_SIZE_BITS..MAX_STANDARD_FRAME_SIZE_BITS;
+
+/// Minimum valid size of an unstuffed extended 29-bit CAN ID frame in bits
+/// 64 bits (0 byte data field)
+pub const MIN_EXTENDED_FRAME_SIZE_BITS: usize = 64;
+/// Maximum valid size of an unstuffed extended 29-bit CAN ID frame in bits
+/// 128 bits (8 byte (max for classical CAN) data field
+pub const MAX_EXTENDED_FRAME_SIZE_BITS: usize = 128;
+/// Range of the valid size a 29-bit extended unstuffed CAN frame can be in bits.
+pub const VALID_EXTENDED_FRAME_SIZE_BITS: Range<usize> = 
+    MIN_EXTENDED_FRAME_SIZE_BITS..MAX_EXTENDED_FRAME_SIZE_BITS;
+
+/// The bits in an 11-bit CAN ID that contain the int that represents the length of the data
+const STANDARD_DLC_BIT_RANGE_IDX: Range<usize> = 15..18;
+/// The bits in a 29-bit CAN ID that contain the int that represents the length of the data
+const EXTENDED_DLC_BIT_RANGE_IDX: Range<usize> = 36..40;
+
+const ARBITRATION_FIELD_SIZE = 
+const CONTROL_FIELD_SIZE_BITS: u8 = 6;
 
 #[repr(u32)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -67,24 +101,25 @@ impl CanId {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FieldSpan {
     pub start: usize,
     pub len: usize,
 }
 
-/// Represents an Encoded CAN frame. (Unstuffed)
-///
-/// This struct is compatible with both 11-bit CAN ID frames and
-/// 29-bit extended CAN ID frames.
-///
-/// The encoded message is stored as a bit vector. The frame includes field spans
-/// that detail where a component of the message starts and it's size. For example,
-/// the data field. `data_field` contains the index in `bits` where it starts at, and the size of
-/// the field.
-#[derive(Debug)]
-pub struct EncodedFrame {
-    pub bits: BitVec<u8, Msb0>, // bits[0] = 0 for start of frame (SOF) bit
+/// The CAN data bits that are sent over the wire between nodes.
+/// 
+/// This is the most accurate representation of CAN frames
+/// sent over the wire compared to the other abstraction types like
+/// `AnnotatedFrame` & `Frame`
+/// 
+/// The first element (index 0) will always be 0 (dominant bit) for the start of frame (SOF) bit.
+pub type WireBits = BitVec<u8, Msb0>;
+
+/// Contains `FieldSpan`'s of each technical field/part of a CAN frame encoded in bits
+/// to denote the start and size of each field 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WireLayout {
     /// For standard CAN frames:
     /// 11-bit CAN ID | RTR bit
     ///
@@ -103,6 +138,127 @@ pub struct EncodedFrame {
     pub crc_field: FieldSpan,
     pub acknowledgement_field: FieldSpan, // ACK slot bit | ACK delimeter
     pub end_of_frame_field: FieldSpan,    // 7 recessive (1) bits at the end of the frame
+}
+
+/// Represents an Encoded CAN frame. (Unstuffed)
+///
+/// This struct is compatible with both 11-bit CAN ID frames and
+/// 29-bit extended CAN ID frames.
+///
+/// The encoded message is stored as a bit vector. 
+/// The frame includes a layout including field spans that detail where a 
+/// component of the message starts and it's size. For example,
+/// the data field. `data_field` contains the index in `bits` where it starts at, and the size of
+/// the field.
+#[derive(Debug)]
+pub struct AnnotatedFrame {
+    bits: WireBits,
+    layout: WireLayout,
+}
+
+impl AnnotatedFrame {
+    pub fn new(bits: WireBits) -> Result<Self, ProtiumFrameError> {
+        // unstuffed | for 11 bit can id frame length:
+        // SOF bit. 
+        // 11 BIT ID. 
+        // RTR BIT. 
+        // IDE BIT. 
+        // R0 BIT. 
+        // DLC (4 BITS). 
+        // DATA FIELD (0-8 BYTES). 
+        // CRC (16 BITS).
+        // ACK FIELD (2 BITS).
+        // EOF FIELD (7 BITS).
+        // 44 bits (when data field is 0 bytes)
+        // 44 bits + 8 bytes = 44 bits + 64 bits = 108 bits (when data field is 8 bytes)
+        // therefore a valid 11 bit CAN ID Frame would be between 44-108 bits
+
+        // unstuffed | for 29 bit can id frame length:
+        // SOF BIT
+        // 11 BIT ID
+        // SRR BIT
+        // IDE BIT
+        // 18 BIT ID
+        // RTR BIT
+        // R1 BIT
+        // R0 BIT
+        // DLC (4 BITS)
+        // DATA FIELD (0-8 BYTES)
+        // CRC (16 BITS)
+        // ACK FIELD (2 BITS)
+        // EOF FIELD (7 BITS)
+        // 64 bits (when data field is 0 bytes)
+        // 64 bits + 8 bytes = 64 bits + 64 bits = 128 bits (when data field is 8 bytes)
+        // therefore, a 29 bit can id frame has a min length of 64 bits and a max length of 128
+
+        let bit_len = bits.len();
+        let mut frame = Self {
+            bits,
+            layout: WireLayout::default()
+        };
+        
+        // validate size of frame
+        if frame.is_extended() {
+            if !VALID_STANDARD_FRAME_SIZE_BITS.contains(&bit_len) {
+                return Err(ProtiumFrameError::InvalidFrameLength)
+            }
+        } else {
+            if !VALID_EXTENDED_FRAME_SIZE_BITS.contains(&bit_len) {
+                return Err(ProtiumFrameError::InvalidFrameLength)
+            }
+        }
+        
+        // safe because we verified the length of the frame
+        // here it cannot be empty
+        if frame.bits[0] == false {
+            // we could set it here instead of throwing an error but 
+            // if its not already set its safe to assume that there
+            // is a flaw in the logic that encoded these bits, so return an error
+            return Err(ProtiumFrameError::StartOfFrameBitNotSet);
+        }
+
+        frame.layout.arbitration_field = FieldSpan { start: 1, len: 12 };
+        frame.layout.control_field = FieldSpan { start: 13, len: 6 };
+        frame.layout.data_field = FieldSpan { start: st, len: () }
+
+        todo!()
+    }
+
+    pub fn is_extended(&self) -> bool {
+        match self.bits.get(IDENTIFIER_EXTENSION_BIT_IDX) {
+            Some(ide_bit) => ide_bit == true,
+            None => false
+        }
+    }
+
+    pub fn data_length(&self) -> u8 {
+        // 4 bit long
+
+        let dlc_bit_range = if self.is_extended() {
+            EXTENDED_DLC_BIT_RANGE_IDX
+        } else {
+            STANDARD_DLC_BIT_RANGE_IDX
+        };
+
+        match self.bits.get(dlc_bit_range) {
+            Some(dlc_bits) => {
+                dlc_bits.load::<u8>()
+            },
+            None => 0
+        }
+    }
+
+    pub fn wire_bits(&self) -> &WireBits {
+        &self.bits
+    }
+
+    pub fn bit_layout(&self) -> &WireLayout {
+        &self.layout
+    }
+
+    pub fn arbitration_bits(&self) -> &WireBits {
+        todo!()
+    }
 }
 
 /// Represents a human friendly CAN frame.
@@ -127,6 +283,11 @@ pub struct Frame {
 pub enum ProtiumFrameError {
     InvalidChecksum,
     InvalidCANId,
+    /// The first element in all `WireBits` must be 1 
+    /// to indicate the start of the frame
+    StartOfFrameBitNotSet,
+    /// 
+    InvalidFrameLength,
 }
 
 impl Frame {
@@ -149,7 +310,7 @@ impl Frame {
         Ok(frame)
     }
 
-    pub fn calculate_checksum(&self) -> Result<u16, ProtiumFrameError> {
+    pub fn checksum(&self) -> Result<u16, ProtiumFrameError> {
         // checksum = input data (as a binary stream) % generator constant
         let input_data = self.create_checksum_input_stream()?;
         let mut crc = 0;
@@ -166,10 +327,6 @@ impl Frame {
 
         let checksum = crc;
         Ok(checksum)
-    }
-
-    pub fn encode(&self) -> Result<EncodedFrame, ProtiumFrameError> {
-        todo!()
     }
 
     /// Create a binary stream of input data for the checksum to compute with.
