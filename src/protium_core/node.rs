@@ -1,4 +1,4 @@
-use crate::can::{AnnotatedFrame, WireBits, Frame, ProtiumFrameError};
+use crate::can::{Frame, ProtiumFrameError, WireBits};
 
 #[repr(u8)]
 #[derive(Debug, Default)]
@@ -20,7 +20,7 @@ pub struct Node {
 
 impl Node {
     #[allow(unused_variables)]
-    pub fn encode(&self, frame: &Frame) -> Result<AnnotatedFrame, ProtiumFrameError> {
+    pub fn encode(&self, frame: &Frame) -> Result<WireBits, ProtiumFrameError> {
         todo!()
     }
 
