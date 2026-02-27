@@ -7,25 +7,15 @@ pub use protium_core::*;
 /// Unit tests
 #[cfg(test)]
 mod tests {
-    use bitvec::{bitvec, order::Msb0};
-
     use super::protium_core::can::*;
-
-    const CAN_ID: CanId = CanId::Standard(0x7EF);
+    use bitvec::{bitvec, order::Msb0, vec::BitVec};
 
     #[test]
     fn checksum() -> Result<(), String> {
-        const EXPECTED_CHECKSUM_RESULT: u16 = 0x342f;
+        const EXPECTED_CHECKSUM_RESULT: u16 = 0x7bf1;
 
-        let payload = vec![0x6c, 0x6c, 0x6f];
-        let Ok(frame) = Frame::new(CAN_ID, payload.clone(), false) else {
-            panic!(
-                "failed to create frame - can_id: `{CAN_ID:?}` | payload: `{:?}`",
-                &payload
-            )
-        };
-
-        let calculated_checksum = frame.checksum().unwrap();
+        let inp = BitVec::from_vec("hello".as_bytes().to_vec());
+        let calculated_checksum = Frame::checksum_with_input(&inp).unwrap();
         if calculated_checksum != EXPECTED_CHECKSUM_RESULT {
             Err(format!(
                 "wrong checksum result for frame - expected: `{:#02x}` received: `{:#02x}`",

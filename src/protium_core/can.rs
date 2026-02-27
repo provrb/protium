@@ -52,17 +52,8 @@ pub enum CanId {
 /// Contains the 11-bit and 18-bit IDs used
 /// to create a 29-bit extended CAN ID
 pub(crate) struct ExtendedIdSplit {
-    base_11_id: u16,
-    ext_18_id: u32,
-}
-
-impl ExtendedIdSplit {
-    pub fn to_bits(&self) -> (BitVec<u16, Msb0>, BitVec<u32, Msb0>) {
-        (
-            BitVec::<u16, Msb0>::from_element(self.base_11_id).split_off(16 - 11), // trim to fit 11 bit CAN id
-            BitVec::<u32, Msb0>::from_element(self.ext_18_id).split_off(32 - 18)
-        )
-    }
+    pub(crate) base_11_id: u16,
+    pub(crate) ext_18_id: u32,
 }
 
 impl CanId {
@@ -88,6 +79,13 @@ impl CanId {
         Ok(())
     }
 
+    pub fn as_u32(&self) -> u32 {
+        match *self {
+            Self::Extended(id) => id,
+            Self::Standard(id) => id as u32,
+        }
+    }
+
     /// Splits an extended, 29-bit CAN ID into its components:
     /// 11-bit CAN ID and an 18-bit CAN ID
     ///
@@ -105,21 +103,6 @@ impl CanId {
                 })
             }
             _ => Err(ProtiumFrameError::InvalidCANId { provided: *self }),
-        }
-    }
-
-    pub fn to_bits(&self) -> BitVec<u32, Msb0> {
-        const SIZE_OF_U32_BITS: usize = size_of::<u32>() * 8;
-
-        match *self {
-            Self::Standard(std_id) => {
-                let mut v = BitVec::<u32, Msb0>::from_element(std_id as u32);
-                v.split_off(SIZE_OF_U32_BITS - 11) // trim to fit 11 bit CAN id
-            }
-            Self::Extended(ext_id) => {
-                let mut v = BitVec::<u32, Msb0>::from_element(ext_id);
-                v.split_off(SIZE_OF_U32_BITS - 29) // trim to fit 29 bit CAN id
-            }
         }
     }
 }
@@ -170,7 +153,6 @@ pub struct WireLayout {
 }
 
 impl WireLayout {
-    ///
     pub fn generate_layout(data_size_bits: usize, extended: bool) -> Self {
         let arbitration_field_size_bits = if extended { 32 } else { 12 };
         let mut layout = WireLayout::default();
@@ -229,12 +211,12 @@ impl WireLayout {
 #[derive(Debug)]
 pub struct AnnotatedFrame {
     /// The fields in bits follow the order the same as they're defined in `WireLayout`:
-    /// 
-    /// 1. Arbitration field 
-    /// 2. Control Field 
-    /// 3. Data Field 
-    /// 4. CRC 
-    /// 5. ACK field 
+    ///
+    /// 1. Arbitration field
+    /// 2. Control Field
+    /// 3. Data Field
+    /// 4. CRC
+    /// 5. ACK field
     /// 6. EOF
     bits: WireBits,
     layout: WireLayout,
@@ -345,7 +327,7 @@ impl AnnotatedFrame {
 
         match self.wire_bits().get(start_idx..end_idx) {
             Some(bits) => bits,
-            None => BitSlice::empty()
+            None => BitSlice::empty(),
         }
     }
 }
@@ -383,6 +365,17 @@ pub enum ProtiumFrameError {
     },
 }
 
+pub(crate) fn push_n_bits(dst: &mut WireBits, value: u32, nbits: usize) {
+    debug_assert!(nbits <= 32);
+    for i in (0..nbits).rev() {
+        dst.push(((value >> i) & 1) != 0);
+    }
+}
+
+pub(crate) fn push_byte(dst: &mut WireBits, byte: u8) {
+    push_n_bits(dst, byte as u32, 8);
+}
+
 impl Frame {
     /// Create a new frame with payload data `payload`
     ///
@@ -403,6 +396,22 @@ impl Frame {
         Ok(frame)
     }
 
+    pub fn id(&self) -> &CanId {
+        &self.can_id
+    }
+
+    pub fn data_length(&self) -> usize {
+        self.payload.len()
+    }
+
+    pub fn data(&self) -> &Vec<u8> {
+        &self.payload
+    }
+
+    pub fn is_remote_request(&self) -> bool {
+        self.is_remote_request
+    }
+
     pub fn is_extended(&self) -> bool {
         match self.can_id {
             CanId::Standard(_) => false,
@@ -410,93 +419,15 @@ impl Frame {
         }
     }
 
-    pub fn annotate(&self) -> Result<AnnotatedFrame, ProtiumFrameError> {
-        let capacity = if self.is_extended() {
-            MAX_EXTENDED_FRAME_SIZE_BITS
-        } else {
-            MAX_STANDARD_FRAME_SIZE_BITS
-        };
-
-        let mut bitstream = BitVec::<u8, Msb0>::with_capacity(capacity);
-        bitstream.push(false); // SOF bit
-
-        // arbitration field
-        if self.is_extended() {
-            // 11 BIT ID. SRR. IDE. 18 BIT ID. RTR
-            let can_id = self.can_id.split_extended_id()?;
-            let (std_can_id_bits, ext_can_id_bits) = can_id.to_bits();
-            
-            // 11 bit CAN id
-            for bit in std_can_id_bits {
-                bitstream.push(bit);
-            }
-
-            bitstream.push(true); // SRR bit - always 1
-            bitstream.push(true); // IDE bit - 1 because this is an extended frame
-            
-            // 18 bit CAN ID
-            for bit in ext_can_id_bits {
-                bitstream.push(bit);
-            }
-            bitstream.push(self.is_remote_request); // RTR bit
-        } else {
-            // 11 BIT ID. RTR
-            let std_can_id_bits = self.can_id.to_bits();
-            for bit in std_can_id_bits {
-                bitstream.push(bit);
-            }
-
-            bitstream.push(self.is_remote_request); // RTR bit
-        }
-        
-        // control field
-        // IDE bit for non-extended frames (which is always false) or r0 bit (which is also always false) for extended frames
-        bitstream.push(false);
-        bitstream.push(false); // r1 bit (always 0)
-        // data length code
-        let dlc: BitVec<usize, Msb0> = BitVec::from_element(self.payload.len()).split_off(
-            (size_of::<usize>() * 8) - 4
-        );
-        for bit in dlc.clone() {
-            bitstream.push(bit);
-        }
-
-        // data field
-        let bit_payload = BitVec::<u8, Msb0>::from_vec(self.payload.clone());
-        for bit in bit_payload {
-            bitstream.push(bit);
-        }
-
-        // dbg!("{:?}", size_of::<usize>());
-        // dbg!("dlc: {:?}", dlc);
-
-        // CRC field
-        let checksum = self.checksum()?;
-        // dbg!("checksum: {#02b}", checksum);
-        let checksum_bits: BitVec<u16, Msb0> = BitVec::from_element(checksum).split_off(16 - 15);
-        for bit in checksum_bits {
-            bitstream.push(bit);
-        }
-        bitstream.push(true); // CRC delimeter - comes after checksum bits
-
-        // ACK field
-        bitstream.push(true); // ack slot. transmitter sets to 1
-        bitstream.push(true); // ack delimeter - always 1
-
-        // end of frame field. add 7 recessive bits at the end of the frame
-        for _ in 0..7 {
-            bitstream.push(true);
-        }
-
-        // println!("[Frame::annotate()] bit stream is {:?}", bitstream);
-        AnnotatedFrame::new(bitstream)
-    }
-
     pub fn checksum(&self) -> Result<u16, ProtiumFrameError> {
         // checksum = input data (as a binary stream) % generator constant
         let input_data = self.create_checksum_input_stream()?;
+        Frame::checksum_with_input(&input_data)
+    }
+
+    pub fn checksum_with_input(input_data: &BitVec<u8, Msb0>) -> Result<u16, ProtiumFrameError> {
         let mut crc = 0;
-        for bit in &input_data {
+        for bit in input_data {
             let feedback = ((crc >> 14) & 1) ^ (*bit as u16);
 
             crc <<= 1;
@@ -516,17 +447,6 @@ impl Frame {
     /// The checksum binary input data consists of:
     /// SOF bit (always 0) | Arbitration field | Control field | Data field
     fn create_checksum_input_stream(&self) -> Result<BitVec<u8, Msb0>, ProtiumFrameError> {
-        fn push_n_bits(dst: &mut BitVec<u8, Msb0>, value: u32, nbits: usize) {
-            debug_assert!(nbits <= 32);
-            for i in (0..nbits).rev() {
-                dst.push(((value >> i) & 1) != 0);
-            }
-        }
-
-        fn push_byte(dst: &mut BitVec<u8, Msb0>, byte: u8) {
-            push_n_bits(dst, byte as u32, 8);
-        }
-
         // input data = [1 | xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx (32 bits) | xxxx xx (6 bits) | (up to 64 bits)]
         // convert input data into binary stream
         let mut input_data = BitVec::<u8, Msb0>::new();
@@ -555,13 +475,11 @@ impl Frame {
         push_n_bits(&mut input_data, self.payload.len() as u32, 4); // Data length code
 
         // Data field
-        for byte in &self.payload {
+        for byte in self.data() {
             push_byte(&mut input_data, *byte);
         }
 
         push_n_bits(&mut input_data, 0, 15);
-
-        // println!("[checksum] input stream: {}", input_data);
 
         Ok(input_data)
     }
