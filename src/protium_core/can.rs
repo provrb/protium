@@ -228,6 +228,14 @@ impl WireLayout {
 /// the field.
 #[derive(Debug)]
 pub struct AnnotatedFrame {
+    /// The fields in bits follow the order the same as they're defined in `WireLayout`:
+    /// 
+    /// 1. Arbitration field 
+    /// 2. Control Field 
+    /// 3. Data Field 
+    /// 4. CRC 
+    /// 5. ACK field 
+    /// 6. EOF
     bits: WireBits,
     layout: WireLayout,
 }
@@ -329,6 +337,16 @@ impl AnnotatedFrame {
 
     pub fn bit_layout(&self) -> &WireLayout {
         &self.layout
+    }
+
+    pub fn get_bit_field(&self, field_data: &FieldSpan) -> &BitSlice<u8, Msb0> {
+        let start_idx = field_data.start;
+        let end_idx = field_data.end();
+
+        match self.wire_bits().get(start_idx..end_idx) {
+            Some(bits) => bits,
+            None => BitSlice::empty()
+        }
     }
 }
 
@@ -449,12 +467,12 @@ impl Frame {
             bitstream.push(bit);
         }
 
-        dbg!("{:?}", size_of::<usize>());
-        dbg!("dlc: {:?}", dlc);
+        // dbg!("{:?}", size_of::<usize>());
+        // dbg!("dlc: {:?}", dlc);
 
         // CRC field
         let checksum = self.checksum()?;
-        dbg!("checksum: {#02b}", checksum);
+        // dbg!("checksum: {#02b}", checksum);
         let checksum_bits: BitVec<u16, Msb0> = BitVec::from_element(checksum).split_off(16 - 15);
         for bit in checksum_bits {
             bitstream.push(bit);
@@ -470,7 +488,7 @@ impl Frame {
             bitstream.push(true);
         }
 
-        println!("[Frame::annotate()] bit stream is {:?}", bitstream);
+        // println!("[Frame::annotate()] bit stream is {:?}", bitstream);
         AnnotatedFrame::new(bitstream)
     }
 
@@ -541,7 +559,9 @@ impl Frame {
             push_byte(&mut input_data, *byte);
         }
 
-        // push_n_bits(&mut input_data, 0, 15);
+        push_n_bits(&mut input_data, 0, 15);
+
+        // println!("[checksum] input stream: {}", input_data);
 
         Ok(input_data)
     }
