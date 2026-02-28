@@ -29,7 +29,7 @@ mod tests {
     #[test]
     fn annotated_frame_length() {
         assert!(
-            AnnotatedFrame::new(bitvec![u8, Msb0; 1, 0, 1, 0]).is_err(),
+            EncodedFrame::new(bitvec![u8, Msb0; 1, 0, 1, 0]).is_err(),
             "annotated frame length is invalid but was not detected as such"
         );
     }
@@ -47,7 +47,7 @@ mod tests {
         let mut bv = bitvec![u8, Msb0;];
         bv.extend([false; 44].iter());
 
-        AnnotatedFrame::new(bv).map(|_| {})
+        EncodedFrame::new(bv).map(|_| {})
     }
 
     #[test]
@@ -58,7 +58,7 @@ mod tests {
         bv.extend([false; 110].iter());
 
         assert!(
-            AnnotatedFrame::new(bv).is_err(),
+            EncodedFrame::new(bv).is_err(),
             "annotated frame length is too big but was not detected as such"
         );
     }
@@ -75,7 +75,7 @@ mod tests {
         bv.set(18, false);
 
         assert!(
-            AnnotatedFrame::new(bv).is_ok(),
+            EncodedFrame::new(bv).is_ok(),
             "gave dlc of 8 bytes (64 bits) and frame detected and sized itself incorrectly"
         );
     }

@@ -96,4 +96,9 @@ impl Node {
     pub fn transmit(&self, frame: &Frame) -> Result<(), ProtiumFrameError> {
         todo!()
     }
+
+    #[allow(unused_variables)]
+    pub fn receive(&self, bits: WireBits) -> Result<Frame, ProtiumFrameError> {
+        todo!()
+    }
 }

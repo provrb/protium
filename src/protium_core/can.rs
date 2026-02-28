@@ -39,6 +39,26 @@ const STANDARD_DLC_BIT_RANGE_IDX: RangeInclusive<usize> = 15..=18;
 /// The bits in a 29-bit CAN ID that contain the int that represents the length of the data
 const EXTENDED_DLC_BIT_RANGE_IDX: RangeInclusive<usize> = 35..=38;
 
+/// An API error, solely for the Protium API: not related to any ISO/protocol/technical errors.
+///
+/// Used in Results to determine the outcome of a frame-related API call
+#[derive(Debug, Error)]
+pub enum ProtiumFrameError {
+    #[error("CAN id is invalid. got `{provided:?}`")]
+    InvalidCANId { provided: CanId },
+    /// The first element in all `WireBits` must be 0
+    /// to indicate the start of the frame
+    #[error("start of frame bit is invalid. SOF bit must always be '0' (false)")]
+    InvalidStartOfFrameBit,
+    #[error("frame length is invalid. got `{provided}` bits but expected range `{expected:?}`")]
+    InvalidFrameLength {
+        provided: usize,
+        expected: RangeInclusive<usize>,
+    },
+    #[error("field in frame is invalid/corrupted. field bits: `{field_bits}`")]
+    InvalidFrameField { field_bits: BitVec<u8, Msb0> },
+}
+
 #[repr(u32)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum CanId {
@@ -122,8 +142,7 @@ impl FieldSpan {
 /// The CAN data bits that are sent over the wire between nodes.
 ///
 /// This is the most accurate representation of CAN frames
-/// sent over the wire compared to the other abstraction types like
-/// `AnnotatedFrame` & `Frame`
+/// sent over the wire compared to the other abstraction types like `Frame`
 ///
 /// The first element (index 0) will always be 0 (dominant bit) for the start of frame (SOF) bit.
 pub type WireBits = BitVec<u8, Msb0>;
@@ -190,7 +209,8 @@ impl WireLayout {
         debug_assert!(
             range_to_check
                 .contains(&(layout.end_of_frame_field.start + layout.end_of_frame_field.len)),
-            "eof_start + eof_len is not in valid frame size range. got: {}",
+            "`eof_start + eof_len` is not in valid frame size range.
+            this must mean one of the fields is misaligned and not the right size. got: {}",
             layout.end_of_frame_field.start + layout.end_of_frame_field.len
         );
 
@@ -209,7 +229,7 @@ impl WireLayout {
 /// the data field. `data_field` contains the index in `bits` where it starts at, and the size of
 /// the field.
 #[derive(Debug)]
-pub struct AnnotatedFrame {
+pub struct EncodedFrame {
     /// The fields in bits follow the order the same as they're defined in `WireLayout`:
     ///
     /// 1. Arbitration field
@@ -222,7 +242,7 @@ pub struct AnnotatedFrame {
     layout: WireLayout,
 }
 
-impl AnnotatedFrame {
+impl EncodedFrame {
     pub fn new(bits: WireBits) -> Result<Self, ProtiumFrameError> {
         // unstuffed | for 11 bit can id frame length:
         // SOF bit. | 11 BIT ID. | RTR BIT. | IDE BIT. | R0 BIT. | DLC (4 BITS). |
@@ -313,12 +333,44 @@ impl AnnotatedFrame {
         }
     }
 
+    /// Return a reference to the underlying bitstream field that contains
+    /// an entire unstuffed encoded CAN frame as binary
     pub fn wire_bits(&self) -> &WireBits {
         &self.bits
     }
 
+    /// Return a reference to how the bits of the underlying
+    /// encoded CAN frame are laid out, including the index where each
+    /// field in the CAN frame starts and ends, in the bitstream.
     pub fn bit_layout(&self) -> &WireLayout {
         &self.layout
+    }
+
+    /// Retrieve the 15-bit calculated CRC-15 CAN checksum saved in the
+    /// encoded bitstream
+    /// 
+    /// Takes the 16 bits from the CRC field, drops the last bit (CRC delimeter - always 1),
+    /// and converts the first 15-bits (checksum in bits) to a u16 (big endian).
+    pub fn included_checksum(&self) -> Result<u16, ProtiumFrameError> {
+        let crc_bits = self.get_bit_field(&self.layout.crc_field);
+
+        debug_assert_eq!(
+            crc_bits.len(),
+            16,
+            "CRC field must be 16 bits including: 15-bit checksum + 1-bit CRC delimeter, got `{}` bit length instead",
+            crc_bits.len()
+        );
+
+        // first 15 bits is the checksum
+        // last bit is the crc delimeter
+        let (_, checksum_bits) =
+            crc_bits
+                .split_last()
+                .ok_or(ProtiumFrameError::InvalidFrameField {
+                    field_bits: crc_bits.to_bitvec(),
+                })?;
+        
+        Ok(checksum_bits.load_be::<u16>())
     }
 
     pub fn get_bit_field(&self, field_data: &FieldSpan) -> &BitSlice<u8, Msb0> {
@@ -343,26 +395,6 @@ pub struct Frame {
     can_id: CanId,
     payload: Vec<u8>,
     is_remote_request: bool,
-}
-
-/// An API error that is not to be confused with any technical error
-/// regarding the wire.
-///
-/// Used in Results to determine the outcome of a `Frame` API call, like
-/// `Frame::calculate_checksum()``
-#[derive(Debug, Error)]
-pub enum ProtiumFrameError {
-    #[error("CAN id is invalid. got `{provided:?}`")]
-    InvalidCANId { provided: CanId },
-    /// The first element in all `WireBits` must be 0
-    /// to indicate the start of the frame
-    #[error("start of frame bit is invalid. SOF bit must always be '0' (false)")]
-    InvalidStartOfFrameBit,
-    #[error("frame length is invalid. got `{provided}` bits but expected range `{expected:?}`")]
-    InvalidFrameLength {
-        provided: usize,
-        expected: RangeInclusive<usize>,
-    },
 }
 
 pub(crate) fn push_n_bits(dst: &mut WireBits, value: u32, nbits: usize) {

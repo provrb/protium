@@ -1,6 +1,6 @@
 use bitvec::vec::BitVec;
 use protium::{
-    can::{AnnotatedFrame, CanId, Frame},
+    can::{CanId, EncodedFrame, Frame},
     node::Node,
 };
 
@@ -19,7 +19,7 @@ fn main() {
 
         let wire_bits = Node::encode(&frame).unwrap();
         println!("{}", wire_bits);
-        let annotated = AnnotatedFrame::new(wire_bits).unwrap();
+        let annotated = EncodedFrame::new(wire_bits).unwrap();
         let layout = annotated.bit_layout();
         println!("annotated bit stream: `{}`", annotated.wire_bits());
 
