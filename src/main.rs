@@ -1,51 +1,35 @@
-use bitvec::vec::BitVec;
+use std::{thread::sleep, time::Duration};
+
 use protium::{
-    can::{CanId, EncodedFrame, Frame},
+    bus::Bus,
+    can::{CanId, Frame},
     node::Node,
 };
 
+const TCM_NODE_ID: CanId = CanId::Standard(0x7EF);
+const ECU_NODE_ID: CanId = CanId::Standard(0x7E8);
+
 fn main() {
-    let can_id = CanId::Standard(0x7EF);
-    // 0111111011110001000110001000100001011111111
-    // 01111110111100010000110001000100001011111111
-    let payload: Vec<u8> = "hello".as_bytes().to_vec();
-    if let Ok(frame) = Frame::new(can_id, payload, false) {
-        //     // dbg!(frame);
-        //     let x = frame.annotate().unwrap();
-        // println!("{:#02x}", frame.checksum().unwrap());
-        let inp = BitVec::from_vec("hello".as_bytes().to_vec());
-        let checksum = Frame::checksum_with_input(&inp).unwrap();
-        println!("checksum: {:#02x}", checksum);
+    let mut bus = Bus::new(10);
 
-        let wire_bits = Node::encode(&frame).unwrap();
-        println!("{}", wire_bits);
-        let annotated = EncodedFrame::new(wire_bits).unwrap();
-        let layout = annotated.bit_layout();
-        println!("annotated bit stream: `{}`", annotated.wire_bits());
+    let mut tcm = Node::new(TCM_NODE_ID);
+    let ecu = Node::new(ECU_NODE_ID);
 
-        println!(
-            "[annotated] arbitration field: `{}`",
-            annotated.get_bit_field(&layout.arbitration_field)
-        );
-        println!(
-            "[annotated] control field: `{}`",
-            annotated.get_bit_field(&layout.control_field)
-        );
-        println!(
-            "[annotated] data field: `{}`",
-            annotated.get_bit_field(&layout.data_field)
-        );
-        println!(
-            "[annotated] ACK field: `{}`",
-            annotated.get_bit_field(&layout.acknowledgement_field)
-        );
-        println!(
-            "[annotated] CRC field: `{}`",
-            annotated.get_bit_field(&layout.crc_field)
-        );
-        println!(
-            "[annotated] EOF field: `{}`",
-            annotated.get_bit_field(&layout.end_of_frame_field)
-        );
+    let frame = Frame::new(
+        TCM_NODE_ID,
+        "Hello from the TCM!".as_bytes().to_vec(),
+        false,
+    )
+    .unwrap();
+    tcm.transmit(frame).unwrap();
+
+    bus.register_node(ecu);
+    bus.register_node(tcm);
+
+    while bus.tick() {
+        sleep(Duration::from_millis(10));
     }
+
+    dbg!(bus.get_node(TCM_NODE_ID));
+    dbg!(bus.get_node(ECU_NODE_ID));
 }

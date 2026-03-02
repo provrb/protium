@@ -1,5 +1,5 @@
 use bitvec::prelude::*;
-use std::ops::RangeInclusive;
+use std::{fmt::Display, ops::RangeInclusive};
 use thiserror::Error;
 
 /// The generator polynomial constant used for CRC-15 (used by CAN) checksum
@@ -39,6 +39,8 @@ const STANDARD_DLC_BIT_RANGE_IDX: RangeInclusive<usize> = 15..=18;
 /// The bits in a 29-bit CAN ID that contain the int that represents the length of the data
 const EXTENDED_DLC_BIT_RANGE_IDX: RangeInclusive<usize> = 35..=38;
 
+pub const IDE_BIT_IDX: usize = 13;
+
 /// An API error, solely for the Protium API: not related to any ISO/protocol/technical errors.
 ///
 /// Used in Results to determine the outcome of a frame-related API call
@@ -67,6 +69,12 @@ pub enum CanId {
     /// 29-bit extended CAN ID.
     /// consists of 11-bit base id combined with an 18-bit extended id
     Extended(u32),
+}
+
+impl Display for CanId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "0x{:02x}", self.as_u32())
+    }
 }
 
 /// Contains the 11-bit and 18-bit IDs used
@@ -216,6 +224,21 @@ impl WireLayout {
 
         layout
     }
+
+    pub fn before_data(extended: bool) -> Self {
+        let arbitration_field_size_bits = if extended { 32 } else { 12 };
+        let mut layout = WireLayout::default();
+        layout.arbitration_field = FieldSpan {
+            start: 1,
+            len: arbitration_field_size_bits,
+        };
+        layout.control_field = FieldSpan {
+            start: layout.arbitration_field.end(),
+            len: 6,
+        };
+
+        layout
+    }
 }
 
 /// Represents an Encoded CAN frame. (Unstuffed)
@@ -348,7 +371,7 @@ impl EncodedFrame {
 
     /// Retrieve the 15-bit calculated CRC-15 CAN checksum saved in the
     /// encoded bitstream
-    /// 
+    ///
     /// Takes the 16 bits from the CRC field, drops the last bit (CRC delimeter - always 1),
     /// and converts the first 15-bits (checksum in bits) to a u16 (big endian).
     pub fn included_checksum(&self) -> Result<u16, ProtiumFrameError> {
@@ -369,7 +392,7 @@ impl EncodedFrame {
                 .ok_or(ProtiumFrameError::InvalidFrameField {
                     field_bits: crc_bits.to_bitvec(),
                 })?;
-        
+
         Ok(checksum_bits.load_be::<u16>())
     }
 
