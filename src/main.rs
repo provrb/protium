@@ -15,21 +15,28 @@ fn main() {
     let mut tcm = Node::new(TCM_NODE_ID);
     let ecu = Node::new(ECU_NODE_ID);
 
-    let frame = Frame::new(
-        TCM_NODE_ID,
-        "Hello from the TCM!".as_bytes().to_vec(),
-        false,
-    )
-    .unwrap();
-    tcm.transmit(frame).unwrap();
+    let frame = Frame::new(TCM_NODE_ID, r"TC".as_bytes().to_vec(), false).unwrap();
+
+    println!(
+        "TCM Node wants to send payload: {:#?} with len: {} - {}",
+        &frame.data(),
+        &frame.data_length(),
+        frame.is_extended()
+    );
+
+    tcm.prepare_transmission(&frame).unwrap();
+    dbg!(&tcm);
+    
 
     bus.register_node(ecu);
     bus.register_node(tcm);
 
-    while bus.tick() {
+    let mut tick_count = 0;
+    while tick_count < 200 {
+        bus.tick();
+        tick_count+=1;
         sleep(Duration::from_millis(10));
     }
 
-    dbg!(bus.get_node(TCM_NODE_ID));
-    dbg!(bus.get_node(ECU_NODE_ID));
+    println!("{:?}", bus.get_node(ECU_NODE_ID).unwrap());
 }

@@ -12,7 +12,7 @@ const CRC_15_GENERATOR_POLYNOMIAL: u16 = 0b0100010110011001;
 /// if the CAN Frame is a 29-bit CAN ID frame or 11-bit CAN ID Frame
 ///
 /// The bit index for the IDE  is the same for both 29-bit and 11-bit CAN frames
-const IDENTIFIER_EXTENSION_BIT_IDX: usize = 13;
+pub(crate) const IDENTIFIER_EXTENSION_BIT_IDX: usize = 13;
 
 /// Minimum valid size of an unstuffed 11-bit CAN ID frame in bits
 /// 44 bits (0 byte data field)
@@ -35,11 +35,12 @@ pub const VALID_EXTENDED_FRAME_SIZE_BITS: RangeInclusive<usize> =
     MIN_EXTENDED_FRAME_SIZE_BITS..=MAX_EXTENDED_FRAME_SIZE_BITS;
 
 /// The bits in an 11-bit CAN ID that contain the int that represents the length of the data
-const STANDARD_DLC_BIT_RANGE_IDX: RangeInclusive<usize> = 15..=18;
+pub(crate) const STANDARD_DLC_BIT_RANGE_IDX: RangeInclusive<usize> = 15..=18;
 /// The bits in a 29-bit CAN ID that contain the int that represents the length of the data
-const EXTENDED_DLC_BIT_RANGE_IDX: RangeInclusive<usize> = 35..=38;
+pub(crate) const EXTENDED_DLC_BIT_RANGE_IDX: RangeInclusive<usize> = 35..=38;
 
-pub const IDE_BIT_IDX: usize = 13;
+/// For Protium, CAN payloads are limited to 8 bytes
+pub const MAX_CAN_PAYLOAD_BYTES: usize = 8;
 
 /// An API error, solely for the Protium API: not related to any ISO/protocol/technical errors.
 ///
@@ -59,6 +60,8 @@ pub enum ProtiumFrameError {
     },
     #[error("field in frame is invalid/corrupted. field bits: `{field_bits}`")]
     InvalidFrameField { field_bits: BitVec<u8, Msb0> },
+    #[error("invalid frame payload size (bytes). got `{invalid_size}` bytes")]
+    InvalidPayloadSize { invalid_size: usize },
 }
 
 #[repr(u32)]
@@ -221,21 +224,6 @@ impl WireLayout {
             this must mean one of the fields is misaligned and not the right size. got: {}",
             layout.end_of_frame_field.start + layout.end_of_frame_field.len
         );
-
-        layout
-    }
-
-    pub fn before_data(extended: bool) -> Self {
-        let arbitration_field_size_bits = if extended { 32 } else { 12 };
-        let mut layout = WireLayout::default();
-        layout.arbitration_field = FieldSpan {
-            start: 1,
-            len: arbitration_field_size_bits,
-        };
-        layout.control_field = FieldSpan {
-            start: layout.arbitration_field.end(),
-            len: 6,
-        };
 
         layout
     }
@@ -413,7 +401,7 @@ impl EncodedFrame {
 /// frame into accessible fields. Recessive and dominant bits like the ACK slot,
 /// SOF delimeter, and unnecessary things like the IDE are not included in this struct
 /// and are only present in `EncodedFrame`'s.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Frame {
     can_id: CanId,
     payload: Vec<u8>,
@@ -442,13 +430,17 @@ impl Frame {
     ) -> Result<Self, ProtiumFrameError> {
         can_id.validate()?;
 
-        let frame = Frame {
+        if payload.len() > MAX_CAN_PAYLOAD_BYTES {
+            return Err(ProtiumFrameError::InvalidPayloadSize {
+                invalid_size: payload.len(),
+            });
+        }
+
+        Ok(Frame {
             can_id,
             payload,
             is_remote_request,
-        };
-
-        Ok(frame)
+        })
     }
 
     pub fn id(&self) -> &CanId {

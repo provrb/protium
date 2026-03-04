@@ -1,8 +1,9 @@
-use bitvec::{field::BitField, order::Msb0, vec::BitVec};
-
 use crate::can::{
-    self, CanId, Frame, IDE_BIT_IDX, MAX_EXTENDED_FRAME_SIZE_BITS, MAX_STANDARD_FRAME_SIZE_BITS, ProtiumFrameError, WireBits, WireLayout, push_byte, push_n_bits
+    push_byte, push_n_bits, CanId, Frame, ProtiumFrameError, WireBits, WireLayout,
+    EXTENDED_DLC_BIT_RANGE_IDX, IDENTIFIER_EXTENSION_BIT_IDX, MAX_EXTENDED_FRAME_SIZE_BITS,
+    MAX_STANDARD_FRAME_SIZE_BITS, STANDARD_DLC_BIT_RANGE_IDX,
 };
+use bitvec::{bitvec, field::BitField, order::Msb0, vec::BitVec};
 
 #[derive(Debug, Default)]
 pub enum ErrorState {
@@ -22,19 +23,25 @@ pub enum NodeState {
     Error,
 }
 
-#[derive(Debug)]
-struct BitStream {
-    bits: WireBits,
-    curr_bit_idx: usize,
-}
-
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ReceiveStream {
     bits: WireBits,
-    curr_bit_idx: usize,
+    rc_idx: usize,
+
+    // Data to gather about the frame
+    // we're receiving. We piece together
+    // this data as we are receiving the bits
     is_extended_frame: bool,
     frame_data_length: Option<u16>,
     frame_dlc_bits: WireBits,
+}
+
+#[derive(Debug)]
+struct TransmitStream {
+    bits: WireBits,
+    ts_idx: usize,
+    ts_frame: Frame,
+    ts_frame_layout: WireLayout,
 }
 
 #[derive(Debug)]
@@ -49,8 +56,7 @@ pub struct Node {
     receive_error_counter: u16,
     transmit_error_counter: u16,
 
-    current_transmitting_frame: Option<Frame>,
-    transmit_stream: Option<BitStream>,
+    transmit_stream: Option<TransmitStream>,
     receive_stream: Option<ReceiveStream>,
 }
 
@@ -64,7 +70,6 @@ impl Node {
             receive_error_counter: 0,
             transmit_error_counter: 0,
 
-            current_transmitting_frame: None,
             transmit_stream: None,
             receive_stream: None,
         }
@@ -120,8 +125,14 @@ impl Node {
         // 3. Data length code (DLC), 4 bits long. Tells the size of the payload in bytes.
         bitstream.push(false); // 1. IDE/r0 bit (always 0)
         bitstream.push(false); // 2. r1 bit (always 0)
+        println!("bit stream b4: {}", bitstream);
         push_n_bits(&mut bitstream, frame.data_length() as u32, 4); // 3. DLC
-
+        println!(
+            "bitstream. data length: `{}` as bits: `{:b}`. last four bits are dlc: {}",
+            frame.data_length() as u32,
+            frame.data_length() as u32,
+            bitstream
+        );
         // Data Field
         // Push all bytes of data into the bitstream as bits
         for byte in frame.data() {
@@ -168,140 +179,184 @@ impl Node {
         self.state = NodeState::Error;
     }
 
-    /// Sets the nodes current state and clears the error state, if any.
-    pub(crate) fn set_state(&mut self, state: NodeState) {
-        if state == self.state {
-            return;
-        }
-
-        println!(
-            "[Node:{}] Switched state from `{:?}` to `{:?}`",
-            self.can_id, self.state, state
-        );
-        self.state = state;
-        self.error_state = ErrorState::None;
-
-        self.reset_transmit_stream();
-    }
-
-    pub fn get_state(&self) -> NodeState {
-        self.state
-    }
-
-    pub fn transmit(&mut self, frame: Frame) -> Result<(), ProtiumFrameError> {
-        let encoded = Node::encode(&frame).inspect_err(|_| {
+    pub fn prepare_transmission(&mut self, frame: &Frame) -> Result<(), ProtiumFrameError> {
+        let encoded = Node::encode(frame).inspect_err(|_| {
             self.error(true);
         })?;
 
-        self.current_transmitting_frame = Some(frame);
-        self.transmit_stream = Some(BitStream {
-            bits: encoded,
-            curr_bit_idx: 0,
-        });
+        self.transmit_stream = Some(
+            TransmitStream {
+                bits: encoded,
+                ts_idx: 0,
+                ts_frame: frame.clone(),
+                ts_frame_layout: WireLayout::generate_layout(frame.data_length(), frame.is_extended())
+            }
+        );
 
         self.state = NodeState::Transmitting;
         Ok(())
     }
 
-    fn reset_transmit_stream(&mut self) {
+    pub fn reset_transmission(&mut self) {
         self.transmit_stream = None;
     }
 
-    pub(crate) fn transmit_bit(&mut self) -> Option<bool> {
-        match &mut self.transmit_stream {
-            Some(stream) => {
-                if stream.curr_bit_idx + 1 > stream.bits.len() {
-                    return None;
+    pub fn drive_bit(&mut self, peek: bool) -> Option<bool> {
+        todo!()
+    }
+
+    pub fn read_wire(&mut self, wire: bool) {
+        if self.state == NodeState::Receiving {
+            let rs_stream = self.receive_stream.get_or_insert_default();
+            
+            rs_stream.bits.push(wire);
+            rs_stream.rc_idx += 1;
+        }
+
+        if self.state == NodeState::Transmitting {
+            let Some(ts_stream) = self.transmit_stream.as_mut() else {
+                // we have no data to send. set state to receiving and return
+                self.state = NodeState::Receiving;
+                return;
+            };
+
+            // the current bit idx of what bit to transmit next
+            // therefore, last bit idx is ts_idx - 1
+            let ts_idx = ts_stream.ts_idx;
+            let last_ts_idx = ts_idx.saturating_sub(1);
+            if let Some(last_sent) = ts_stream.bits.get(last_ts_idx) {
+                // a bit on the wire has changed and is not the same as the bit we sent
+                if wire != last_sent {
+                    // this should ONLY happen if we reached the acknowledgement field.
+                    // a receiver will change the bit of the ack slot to tell us a node received it
+                    if last_ts_idx == ts_stream.ts_frame_layout.acknowledgement_field.start {
+                        // this is fine, a receiver flipped the ack slot like theyre supposed to
+                    } else {
+                        // is it possible we lost trasmission to another node?
+                        // check if we lost transmission
+                        // we only need to check if we are in CAN IDS, RTR, or IDE
+                        let arbitration_loss_possible_range_idx = 0..=ts_stream.ts_frame_layout.arbitration_field.end();
+                        if arbitration_loss_possible_range_idx.contains(&ts_idx) {
+                            // lost transmission. set state to receiving
+                            self.state = NodeState::Receiving;
+                            return;
+                        }
+                    }
+                } else {
+                    // a bit on the wire has not changed. this is acceptable only if
+                    // we didn't just send the ack slot which is supposed to be flipped by a receiver
+                    if last_ts_idx == ts_stream.ts_frame_layout.acknowledgement_field.start {
+                        // we send a recessive ack slot bit and it hasn't changed, meaning no node
+                        // flipped it to tell us a node received our bits
+                        panic!("No receiver flipped ack slot bit.");
+                    }
+
+                    // no problems when trasmitting so keep transmitting
                 }
-
-                let old_idx = stream.curr_bit_idx;
-                stream.curr_bit_idx += 1;
-                stream.bits.get(old_idx).map(|bit| *bit)
             }
-            _ => None,
-        }
+
+            // at this point all possible things that could go wrong when transmitting
+            // have been addressed (lost transmission, invalid ack slot bit)
+            // so increment the idx of the bit to trasnmit
+
+            ts_stream.ts_idx += 1;
+        }        
     }
 
-    /// During transmission, the bus will tell us the bit we
-    /// sent and the bit that won.
-    /// If `used` != `sent` and the bit is apart of the CAN ID, RTR, or IDE bit's
-    /// we lost the wire and must stop transmission.
-    ///
-    /// If `sent` is true and `used` is false and we sent the ACK slot (which is always 1)
-    /// that means that a node received our message. If this does not happen, no node has received
-    /// our message and we must retransmit.
-    pub fn resultant_bus_bit(&mut self, sent: bool, used: bool) {
-        // println!("[Node:{}] Sent bit: `{}` - bit on bus: `{}`", self.id(), sent, used);
-        let Some(frame) = &self.current_transmitting_frame else {
-            return;
-        };
 
-        let Some(stream) = &self.transmit_stream else {
-            return;
-        };
+    // pub fn resultant_bus_bit(&mut self, sent: Option<bool>, used: bool) {
+    //     // println!("[Node:{}] Sent bit: `{:?}` - bit on bus: `{}`", self.id(), sent, used);
 
-        let base_layout = WireLayout::generate_layout(frame.data_length(), frame.is_extended());
-        if sent == true && used == false {
-            // check if we lost transmission
-            // we lose transmission if this bit is apart of CAN ID, RTR, or IDE
-            // and sent != used
-            let arb = base_layout.arbitration_field;
+    //     // receive bit
+    //     let rs = self.receive_stream.get_or_insert(ReceiveStream {
+    //         bits: WireBits::new(),
+    //         curr_bit_idx: 0,
+    //         frame_data_length: None,
+    //         is_extended_frame: false,
+    //         frame_dlc_bits: WireBits::with_capacity(4),
+    //     });
 
-            if (arb.start..arb.end()).contains(&stream.curr_bit_idx) {
-                // we lost transmission. start receiving the messages now
-                self.set_state(NodeState::Receiving);
-            }
-        } else if sent == true && used == true {
-            if stream.curr_bit_idx == base_layout.acknowledgement_field.start {
-                // ack slot not updated by a receiver node
-                panic!(
-                    "[Node:{}] ACK slot bit: `{}` - bit on bus: `{}` - ACK bit not set to 0.",
-                    self.id(),
-                    sent,
-                    used
-                );
-            }
-        }
-    }
+    //     let rs_idx = rs.curr_bit_idx;
 
-    pub(crate) fn receive_bit(&mut self, bit: bool) {
-        let receive_stream = self.receive_stream.get_or_insert(ReceiveStream {
-            bits: WireBits::new(),
-            curr_bit_idx: 0,
-            frame_data_length: None,
-            is_extended_frame: false,
-            frame_dlc_bits: WireBits::with_capacity(4),
-        });
+    //     // try and generate layout
+    //     if rs_idx == IDENTIFIER_EXTENSION_BIT_IDX {
+    //         rs.is_extended_frame = used;
+    //     } else if rs_idx > IDENTIFIER_EXTENSION_BIT_IDX {
+    //         let dlc_idx = if rs.is_extended_frame {
+    //             EXTENDED_DLC_BIT_RANGE_IDX
+    //         } else {
+    //             STANDARD_DLC_BIT_RANGE_IDX
+    //         }; 
+    //         if dlc_idx.contains(&rs_idx) {
+    //             // parse dlc
+    //             rs.frame_dlc_bits.push(used);
+    //         }
+    //     }
 
-        if receive_stream.curr_bit_idx == IDE_BIT_IDX {
-            receive_stream.is_extended_frame = bit;
-        }
+    //     // all dlc bits have been pushed
+    //     // now we can save the data length
+    //     if rs.frame_data_length.is_none() && rs.frame_dlc_bits.len() == 4 {
+    //         rs.frame_data_length = Some(rs.frame_dlc_bits.load_be());
+    //     }
 
-        let dlc_idx_range = if receive_stream.is_extended_frame {
-            32..36
-        } else {
-            15..19
-        };
+    //     let layout = match rs.frame_data_length {
+    //         Some(data_size) => Some(WireLayout::generate_layout(
+    //             data_size as usize,
+    //             rs.is_extended_frame,
+    //         )),
+    //         None => None,
+    //     };
 
-        if dlc_idx_range.contains(&receive_stream.curr_bit_idx) {
-            receive_stream.frame_dlc_bits.push(bit);
-        }
+    //     if let Some(layout) = layout {
+    //         if rs_idx + 1 == layout.acknowledgement_field.start {
+    //             println!("Node is pending acknowledge bit set");
+    //             self.pending_ack = true;
+    //         }
+    //     };
 
-        if receive_stream.frame_dlc_bits.len() == 4 && receive_stream.frame_data_length.is_none() {
-            receive_stream.frame_data_length = Some(receive_stream.frame_dlc_bits.load_be());
-        }
+    //     println!("push bit: {used} @ idx {rs_idx}, ack slot idx: {}", layout.unwrap_or_default().acknowledgement_field.start);
+    //     rs.bits.push(used);
+    //     rs.curr_bit_idx += 1;
 
-        if let Some(data_len) = receive_stream.frame_data_length {
-            // check if this is ack bit
-            let layout = WireLayout::generate_layout(data_len as usize, receive_stream.is_extended_frame);
-            if receive_stream.curr_bit_idx == layout.acknowledgement_field.start && bit {
-                
-            }
-        }
+    //     let Some(sent) = sent else {
+    //         return;
+    //     };
 
-        println!("[Node:{}] Received bit `{}` from bus", self.can_id, bit);
+    //     let Some(layout) = layout else {
+    //         return;
+    //     };
 
-        receive_stream.bits.push(bit);
-        receive_stream.curr_bit_idx = receive_stream.bits.len() - 1;
-    }
+    //     let Some(ts) = self.transmit_stream.as_mut() else {
+    //         println!("[Node:{}] No transmitting stream", self.can_id);
+    //         return;
+    //     };
+    //     let ts_idx = ts.curr_bit_idx.saturating_sub(1);
+    //     if self.state == NodeState::Transmitting {
+    //         if sent && !used {
+    //             // check if we lost transmission
+    //             // we lose transmission if this bit is apart of CAN ID, RTR, or IDE
+    //             // and sent != used
+    //             let arb = layout.arbitration_field;
+
+    //             if (arb.start..arb.end()).contains(&ts_idx) {
+    //                 // we lost transmission. start receiving the messages now
+    //                 println!(
+    //                     "[Node:{}] Lost transmission. Switching to receiving.",
+    //                     self.can_id
+    //                 );
+    //                 self.state = NodeState::Receiving;
+    //             }
+    //         }
+
+    //         if (sent && used) && ts_idx == layout.acknowledgement_field.start {
+    //             // ack slot not updated by a receiver node
+    //             panic!(
+    //                 "[Node:{}] ACK slot bit: `{}` - bit on bus: `{}` - ACK bit not set to 0.",
+    //                 self.id(),
+    //                 sent,
+    //                 used
+    //             );
+    //         }
+    //     }
+    // }
 }
