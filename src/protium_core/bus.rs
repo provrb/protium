@@ -3,6 +3,8 @@ use crate::{
     node::{Node, NodeState, ProtiumNodeError},
 };
 
+/// Current state of the bus. Determines whether or not
+/// the bus is working.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub enum BusState {
     #[default]
@@ -11,6 +13,7 @@ pub enum BusState {
     Transmitting,
 }
 
+/// Represents a CAN bus
 #[derive(Debug, Default)]
 pub struct Bus {
     nodes: Vec<Node>,

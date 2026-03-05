@@ -15,8 +15,27 @@ pub enum ProtiumNodeError {
     NodeLostTransmission,
 }
 
+/// Represents the current Node error state.
+///
+/// Error states happen on different conditions based on the value
+/// of the nodes transmission and receiving error counters.
+/// See the following fields in the [`Node`] struct:
+/// - [`crate::node::Node::transmit_error_counter`]
+/// - [`crate::node::Node::receive_error_counter`]
+///
+/// (let TEC = the nodes transmission error counter, let REC = the nodes receive error counter)
+///
+/// Each error state occurs when the following conditions are met:
+/// None - The node is not in a state of error
+/// Active - TEC < 128 and REC < 128
+/// Passive - TEC >= 128 and REC >= 128
+/// BusOff - TEC > 255
+///
+/// When the node is in the `BusOff` error state, the node will not
+/// receive or transmit to or from the bus unless it is reset or
+/// a consecutive sequence of recessive bits is sent.
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
-pub enum ErrorState {
+pub enum NodeErrorState {
     #[default]
     None,
     Active,
@@ -24,6 +43,15 @@ pub enum ErrorState {
     BusOff,
 }
 
+/// Represents the current state of the Node
+///
+/// Idle - The node is open to transmitting & receiving data from the bus
+/// Sleeping - The node is not open to transmitting & receiving data from the bus
+///            but is not in a state of error
+/// Transmitting - The node is actively sending data via a CAN bus
+/// Receiving - The node is actively receiving data from a CAN bus
+/// Error - The node has experienced an error. Check the [`error_state`] field
+///         and see [`crate::node::NodeErrorState`] for more detailed info on the error
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
 pub enum NodeState {
     #[default]
@@ -34,21 +62,50 @@ pub enum NodeState {
     Error,
 }
 
+/// A stream created when receiving a message from the bus
 #[derive(Debug, Default)]
 struct ReceiveStream {
+    /// The stream of bits received
     bits: WireBits,
+    /// The index of the most recent bit received
     rc_idx: usize,
-    pending_ack: bool, // acknowledge the receiving bits
+    /// A flag set if the receiver wants to flip the ACK slot bit in a message.
+    /// This is required per-protocol. When a receiver successfully receives a mesasge,
+    /// there are no errors (e.g. calculated checksum doesn't equal received checksum),
+    /// this flag will be set and the bus will know to push a dominant bit to all nodes for the ACK slot
+    pending_ack: bool,
 
     // Data to gather about the frame
     // we're receiving. We piece together
     // this data as we are receiving the bits
+    /// Whether or not the frame we're receiving is an extended frame.
+    /// This is true if the Identifier Extension Bit at index
+    /// [`crate::can::IDENTIFIER_EXTENSION_BIT`] in `bits` is 1 (true)
     is_extended_frame: bool,
-    frame_data_length: Option<u16>,
+    /// Contains the bits of "data length code" field apart of a CAN frame.
+    /// Is always 4 bits long and represents the length of the `data` field in a
+    /// CAN frame in bytes.
     frame_dlc_bits: WireBits,
+    /// Represents the size of the data field in the receiving CAN frame in bytes
+    ///
+    /// When `frame_dlc_bits` is full (4 bits long) containing the full data length code,
+    /// it is converted to a u16 and this option will contain that value. Otherwise, it will
+    /// be None.
+    frame_data_length: Option<u16>,
+    /// The interpreted wirebits layout of the frame we're receiving
+    /// The layout is created after we know two things:
+    /// 1. if the frame is extended or not
+    /// 2. the size of the data field in bits
+    /// Because the start and end index of almost every field relies on
+    /// how big the data field is and if the frame is extended.
     frame_layout: Option<WireLayout>,
 }
 
+/// A struct created when transmitting a frame to nodes via a bus
+///
+/// The frame is encoded and stored in `bits` using [`crate::can::Frame::encode`],
+/// and `ts_frame_layout` is generated using [`crate::can::WireLayout`] along with the known
+/// information about the frame before it is encoded (data length size and if its extended)
 #[derive(Debug, Default)]
 struct TransmitStream {
     bits: WireBits,
@@ -56,19 +113,29 @@ struct TransmitStream {
     ts_frame_layout: WireLayout,
 }
 
+/// Represents a node (e.g. ECU) that can send and receive messages on a CAN bus
 #[derive(Debug)]
 pub struct Node {
+    /// The CAN ID of the node. Every Node must have a CAN ID
+    /// The more dominant (0) bits a CAN ID has, the higher priority it's messages
+    /// it sends have over other Nodes
     can_id: CanId,
-
-    /// Only process frames from other nodes
-    /// with the following `CanId`'s
+    /// Only process frames from other nodes with the following `CanId`'s
     filtered_can_ids: Vec<CanId>,
+
+    /// The current state of the node
     state: NodeState,
-    error_state: ErrorState,
+    /// The current error state of the node
+    error_state: NodeErrorState,
+
+    /// The amount of errors encountered on receive
     receive_error_counter: u16,
+    /// The amount of errors encountered on transmission
     transmit_error_counter: u16,
 
+    /// A stream created when transmitting a CAN frame on a CAN bus
     transmit_stream: Option<TransmitStream>,
+    /// A stream created when receiving data on a CAN bus
     receive_stream: Option<ReceiveStream>,
 }
 
@@ -79,12 +146,13 @@ impl PartialEq for Node {
 }
 
 impl Node {
+    /// Create a new Node with CAN ID `can_id` in an `Idle` state, and `None` error state.
     pub fn new(can_id: CanId) -> Self {
         Self {
             can_id,
             filtered_can_ids: Vec::new(),
             state: NodeState::Idle,
-            error_state: ErrorState::None,
+            error_state: NodeErrorState::None,
             receive_error_counter: 0,
             transmit_error_counter: 0,
 
@@ -94,7 +162,7 @@ impl Node {
     }
 
     pub fn is_active(&self) -> bool {
-        if self.state() == NodeState::Error && self.error_state() == ErrorState::BusOff
+        if self.state() == NodeState::Error && self.error_state() == NodeErrorState::BusOff
             || self.state() == NodeState::Sleeping
         {
             // Node is not active
@@ -116,7 +184,7 @@ impl Node {
         self.state
     }
 
-    pub fn error_state(&self) -> ErrorState {
+    pub fn error_state(&self) -> NodeErrorState {
         self.error_state
     }
 
@@ -308,13 +376,13 @@ impl Node {
         };
 
         if self.transmit_error_counter < 128 && self.receive_error_counter < 128 {
-            self.error_state = ErrorState::Active;
+            self.error_state = NodeErrorState::Active;
             // todo: send error frame
         } else if self.transmit_error_counter >= 128 && self.receive_error_counter >= 128 {
-            self.error_state = ErrorState::Passive;
+            self.error_state = NodeErrorState::Passive;
             // todo: send error frame
         } else if self.transmit_error_counter > 255 {
-            self.error_state = ErrorState::BusOff;
+            self.error_state = NodeErrorState::BusOff;
         }
 
         self.state = NodeState::Error;
