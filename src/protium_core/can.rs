@@ -65,7 +65,7 @@ pub enum ProtiumFrameError {
 }
 
 #[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum CanId {
     /// 11-bit standard CAN ID.
     Standard(u16),
@@ -145,6 +145,11 @@ pub struct FieldSpan {
 }
 
 impl FieldSpan {
+    /// The index the field ends before
+    ///
+    /// An example range would be:
+    ///     arbitration field = 0..end
+    /// - the bit at idx `end` would be the start of the control field
     pub fn end(&self) -> usize {
         self.start + self.len
     }
@@ -301,8 +306,7 @@ impl EncodedFrame {
             }
         }
 
-        frame.layout =
-            WireLayout::generate_layout(frame.data_length() as usize, frame.is_extended());
+        frame.layout = WireLayout::generate_layout(frame.data_length_bits(), frame.is_extended());
 
         // expected frame bit length != calculated frame bit length
         if bit_len != frame.layout.end_of_frame_field.end() {
@@ -326,12 +330,11 @@ impl EncodedFrame {
         }
     }
 
-    /// Get the length of the data field in bits
+    /// Get the length of the data field in bytes
     ///
     /// Read the 4-bit long Data Length Code (DLC) in the CAN frame bits
-    /// and convert it to a u16 to get the length of the data in bytes,
-    /// finally, convert the read value into bits.
-    pub fn data_length(&self) -> u16 {
+    /// and convert it to a usize to get the length of the data in bytes.
+    pub fn data_length_bytes(&self) -> usize {
         let dlc_bit_range = if self.is_extended() {
             EXTENDED_DLC_BIT_RANGE_IDX
         } else {
@@ -339,9 +342,14 @@ impl EncodedFrame {
         };
 
         match self.bits.get(dlc_bit_range) {
-            Some(dlc_bits) => dlc_bits.load_be::<u16>() * 8, // (convert bytes to bits)
+            Some(dlc_bits) => dlc_bits.load_be::<usize>(),
             None => 0,
         }
+    }
+
+    /// Get the length of the data field in bits
+    pub fn data_length_bits(&self) -> usize {
+        self.data_length_bytes() * 8
     }
 
     /// Return a reference to the underlying bitstream field that contains
@@ -447,8 +455,12 @@ impl Frame {
         &self.can_id
     }
 
-    pub fn data_length(&self) -> usize {
+    pub fn data_length_bytes(&self) -> usize {
         self.payload.len()
+    }
+
+    pub fn data_length_bits(&self) -> usize {
+        self.payload.len() * 8
     }
 
     pub fn data(&self) -> &Vec<u8> {
@@ -469,6 +481,7 @@ impl Frame {
     pub fn checksum(&self) -> Result<u16, ProtiumFrameError> {
         // checksum = input data (as a binary stream) % generator constant
         let input_data = self.create_checksum_input_stream()?;
+        // println!("Running checksum on frame object. input data: {}", input_data);
         Frame::checksum_with_input(&input_data)
     }
 
@@ -487,6 +500,76 @@ impl Frame {
 
         let checksum = crc;
         Ok(checksum)
+    }
+
+    pub fn encode(&self) -> Result<WireBits, ProtiumFrameError> {
+        let capacity = if self.is_extended() {
+            MAX_EXTENDED_FRAME_SIZE_BITS
+        } else {
+            MAX_STANDARD_FRAME_SIZE_BITS
+        };
+
+        let mut bitstream = WireBits::with_capacity(capacity);
+        bitstream.push(false); // SOF bit
+
+        // Aarbitration Field
+        // For extended frames contains:
+        // 1. 11 Bit CAN ID
+        // 2. Substitute remote request (SRR) bit
+        // 3. Identifier extension (IDE) bit
+        // 4. 18 Bit CAN ID
+        // 5. Remote transmission request (RTR) bit
+        //
+        // For standard frames contains:
+        // 1. 11 Bit CAN ID
+        // 2. Remote transmission request (RTR) bit
+        if self.is_extended() {
+            let split_id = self.id().split_extended_id()?;
+
+            push_n_bits(&mut bitstream, split_id.base_11_id as u32, 11); // 1. 11 bit CAN ID
+            bitstream.push(true); // 2. SRR bit - always 1
+            bitstream.push(true); // 3. IDE bit - 1 because this is an extended frame
+
+            push_n_bits(&mut bitstream, split_id.ext_18_id, 18); // 4. 18 bit CAN ID
+        } else {
+            push_n_bits(&mut bitstream, self.id().as_u32(), 11); // 1. 11 bit CAN ID
+        }
+        bitstream.push(self.is_remote_request()); // RTR bit
+
+        // Control Field
+        //
+        // 1. IDE bit for non-extended frames (which is always 0)
+        //    or r0 bit (which is also always 0) for extended frames
+        // 2. r1 bit (always 0)
+        // 3. Data length code (DLC), 4 bits long. Tells the size of the payload in bytes.
+        bitstream.push(false); // 1. IDE/r0 bit (always 0)
+        bitstream.push(false); // 2. r1 bit (always 0)
+        push_n_bits(&mut bitstream, self.data_length_bytes() as u32, 4); // 3. DLC
+
+        // Data Field
+        // Push all bytes of data into the bitstream as bits
+        for byte in self.data() {
+            push_byte(&mut bitstream, *byte);
+        }
+
+        // CRC Field
+        // Contains:
+        // 1. 15 bit long CRC-15 CAN checksum
+        // 2. CRC delimeter bit (always 1)
+        push_n_bits(&mut bitstream, self.checksum()? as u32, 15); // 1. checksum
+        bitstream.push(true); // 2. CRC delimeter - comes after checksum bits
+
+        // Acknowledgement (ACK) Field
+        // Contains:
+        // 1. ACK slot bit. Transmitters set this bit to 1 and
+        //    receivers set this bit to 0.
+        bitstream.push(true); // 1. ack slot. transmitter sets to 1
+        bitstream.push(true); // 2. ack delimeter - always 1
+
+        // End of Frame (EOF) field.
+        // Contains 7 recessive bits at the end of the frame
+        bitstream.extend([true].repeat(7));
+        Ok(bitstream)
     }
 
     /// Create a binary stream of input data for the checksum to compute with.
@@ -519,7 +602,7 @@ impl Frame {
         // Control field
         input_data.push(false); // IDE bit OR r1 bit that is always 0
         input_data.push(false); // r0 bit
-        push_n_bits(&mut input_data, self.payload.len() as u32, 4); // Data length code
+        push_n_bits(&mut input_data, self.data_length_bytes() as u32, 4); // Data length code
 
         // Data field
         for byte in self.data() {

@@ -1,42 +1,60 @@
-use std::{thread::sleep, time::Duration};
-
 use protium::{
     bus::Bus,
     can::{CanId, Frame},
     node::Node,
 };
-
-const TCM_NODE_ID: CanId = CanId::Standard(0x7EF);
-const ECU_NODE_ID: CanId = CanId::Standard(0x7E8);
+use std::{thread::sleep, time::Duration};
 
 fn main() {
+    // global bus nodes will communicate on
     let mut bus = Bus::new(10);
 
-    let mut tcm = Node::new(TCM_NODE_ID);
-    let ecu = Node::new(ECU_NODE_ID);
+    // example control Modules
+    // ecm has highest priority, followed by tcm, then bcm - based on the CanIds alone
+    let mut ecm = Node::new(CanId::Standard(0x7E8));
+    let mut tcm = Node::new(CanId::Standard(0x7EA));
+    let mut bcm = Node::new(CanId::Standard(0x7EF));
+    bcm.sleep();
 
-    let frame = Frame::new(TCM_NODE_ID, r"TC".as_bytes().to_vec(), false).unwrap();
+    // example frames to send from ecus
+    let engine_oil_temperature = "40".as_bytes().to_vec();
+    let engine_oil_frame = Frame::new(ecm.id(), engine_oil_temperature, false)
+        .expect("failed to create example engine oil frame");
+    let trans_fluid_temperature = "30".as_bytes().to_vec();
+    let trans_fluid_frame = Frame::new(tcm.id(), trans_fluid_temperature, false)
+        .expect("failed to create example transmission oil frame");
 
-    println!(
-        "TCM Node wants to send payload: {:#?} with len: {} - {}",
-        &frame.data(),
-        &frame.data_length(),
-        frame.is_extended()
-    );
+    // prepare nodes to transmit their data when the bus is active
+    ecm.prepare_transmission(&engine_oil_frame)
+        .expect("failed to prepare transmission frame for ECM");
+    tcm.prepare_transmission(&trans_fluid_frame)
+        .expect("failed to prepare transmission frame for TCM");
 
-    tcm.prepare_transmission(&frame).unwrap();
-    dbg!(&tcm);
-    
-
-    bus.register_node(ecu);
+    // register nodes on bus to send/receive
+    bus.register_node(ecm);
     bus.register_node(tcm);
+    bus.register_node(bcm);
 
-    let mut tick_count = 0;
-    while tick_count < 200 {
-        bus.tick();
-        tick_count+=1;
-        sleep(Duration::from_millis(10));
+    // bus ticks
+    loop {
+        if let Err(e) = bus.tick() {
+            println!("Error during bus tick: {e}");
+            return;
+        }
+
+        if !bus.is_active() {
+            break;
+        }
+
+        sleep(Duration::from_millis(10)); // example tick speed
     }
 
-    println!("{:?}", bus.get_node(ECU_NODE_ID).unwrap());
+    for node in bus.get_nodes().iter() {
+        println!(
+            "[Node:{}] State: {:?} - Received bits: `{:?}`",
+            node.id(),
+            node.state(),
+            node.received_bits()
+        );
+    }
 }
