@@ -91,15 +91,29 @@ impl Bus {
         // Set all listening/previously transmitting Nodes to idle
         // Set bus state to idle
         if bits_to_drive_this_tick.is_empty() {
-            for node in self.nodes.iter_mut() {
-                if !node.is_active() {
-                    continue;
-                }
+            let mut keep_bus_active = false;
 
-                node.set_state(NodeState::Idle);
+            // Before setting the bus to idle and concluding there
+            // is no work for the bus to do.
+            // Check if any node needs to retransmit a frame.
+            // If so, then we have more work to do on the bus and cannot go idle yet
+            for node in self.nodes.iter_mut() {
+                if node.pending_retransmission() {
+                    node.set_state(NodeState::Transmitting);
+                    keep_bus_active = true;
+                } else {
+                    if !node.is_active() {
+                        continue;
+                    }
+
+                    node.set_state(NodeState::Idle);
+                }
             }
 
-            self.state = BusState::Idle;
+            if !keep_bus_active {
+                self.state = BusState::Idle;
+            }
+
             return Ok(());
         }
 

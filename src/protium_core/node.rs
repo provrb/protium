@@ -94,8 +94,8 @@ struct ReceiveStream {
     frame_data_length: Option<u16>,
     /// The interpreted wirebits layout of the frame we're receiving
     /// The layout is created after we know two things:
-    /// 1. if the frame is extended or not
-    /// 2. the size of the data field in bits
+    ///     1. if the frame is extended or not
+    ///     2. the size of the data field in bits
     /// Because the start and end index of almost every field relies on
     /// how big the data field is and if the frame is extended.
     frame_layout: Option<WireLayout>,
@@ -111,6 +111,7 @@ struct TransmitStream {
     bits: WireBits,
     ts_idx: usize,
     ts_frame_layout: WireLayout,
+    pending_retransmit: bool,
 }
 
 /// Represents a node (e.g. ECU) that can send and receive messages on a CAN bus
@@ -122,17 +123,14 @@ pub struct Node {
     can_id: CanId,
     /// Only process frames from other nodes with the following `CanId`'s
     filtered_can_ids: Vec<CanId>,
-
     /// The current state of the node
     state: NodeState,
     /// The current error state of the node
     error_state: NodeErrorState,
-
     /// The amount of errors encountered on receive
     receive_error_counter: u16,
     /// The amount of errors encountered on transmission
     transmit_error_counter: u16,
-
     /// A stream created when transmitting a CAN frame on a CAN bus
     transmit_stream: Option<TransmitStream>,
     /// A stream created when receiving data on a CAN bus
@@ -161,6 +159,11 @@ impl Node {
         }
     }
 
+    /// Check if the current node is active and can
+    /// transmit or receive message.
+    ///
+    /// An node is inactive if it is in the `BusOff`` `ErrorState` or
+    /// the node is in the `Sleeping` state
     pub fn is_active(&self) -> bool {
         if self.state() == NodeState::Error && self.error_state() == NodeErrorState::BusOff
             || self.state() == NodeState::Sleeping
@@ -172,39 +175,56 @@ impl Node {
         }
     }
 
+    /// Set the Node to sleep mode
+    /// The node will not receive or transmit data in this mode unless
+    /// [`Node::idle`] or [`Node::prepare_transmission`] is called
     pub fn sleep(&mut self) {
         self.state = NodeState::Sleeping;
     }
 
+    /// Set the Node to idle mode
+    /// The node is not receiving or transmitting but can whenever
+    /// e.g. if this node is idle and another node sends a message, this node will receive
     pub fn idle(&mut self) {
         self.state = NodeState::Idle;
     }
 
+    /// Get the current stae of the node
     pub fn state(&self) -> NodeState {
         self.state
     }
 
+    /// Get the current state of error the node is in
     pub fn error_state(&self) -> NodeErrorState {
         self.error_state
     }
 
+    /// Get the CAN ID of the node
     pub fn id(&self) -> CanId {
         self.can_id
     }
 
+    /// Get a list of CAN IDs, this node has filtered
+    ///
+    /// The node will only process received messages from the
+    /// nodes with the following CAN IDs
     pub fn filtered_can_ids(&self) -> &Vec<CanId> {
         &self.filtered_can_ids
     }
 
+    /// Get a reference to a Node's most recently received bits
     pub fn received_bits(&self) -> Option<&WireBits> {
-        if let Some(rs) = self.receive_stream.as_ref() {
-            Some(&rs.bits)
-        } else {
-            None
-        }
+        self.receive_stream.as_ref().map(|rs| &rs.bits)
     }
 
-    pub fn prepare_transmission(&mut self, frame: &Frame) -> Result<(), ProtiumFrameError> {
+    /// Encode and prepare the transmission of `frame` via CAN bus to allow the node
+    /// to be queried by the bus when checking for transmitting nodes.
+    ///
+    /// When a frame is prepared for transmission, `Node.state` will be `Transmitting` and available
+    /// to be queried by the bus when the bus asks this node what bit to drive. The node will push
+    /// the encoded frame bits, bit by bit on every bus bit tick unless the node lost tranmission
+    /// due to priority.
+    pub fn queue_transmission(&mut self, frame: &Frame) -> Result<(), ProtiumFrameError> {
         let encoded = frame.encode().inspect_err(|_| {
             self.error(true);
         })?;
@@ -216,16 +236,48 @@ impl Node {
                 frame.data_length_bits(),
                 frame.is_extended(),
             ),
+            pending_retransmit: false,
         });
 
         self.state = NodeState::Transmitting;
         Ok(())
     }
 
+    pub fn pending_retransmission(&self) -> bool {
+        if let Some(ts) = &self.transmit_stream {
+            ts.pending_retransmit
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn queue_retransmission(&mut self, queue: bool) {
+        if let Some(ts) = self.transmit_stream.as_mut() {
+            ts.pending_retransmit = queue;
+            if queue {
+                // reset transmit bit idx if we're queuing to retransmit the whole stream
+                ts.ts_idx = 0;
+            }
+        }
+    }
+
+    /// Sets the current state of the node
     pub(crate) fn set_state(&mut self, state: NodeState) {
+        if state == NodeState::Receiving || state == NodeState::Transmitting {
+            // switching to receiving/transmitting so clear/prepare receive_stream
+            self.receive_stream = None;
+        }
+
         self.state = state
     }
 
+    /// Determine what bit to send based on a couple factors.
+    ///
+    /// - If the node is currently transmitting, send the next bit in the transmission bitstream
+    ///   and increment the transmission bit index by 1
+    /// - If the node is receiving, we do not send any bits, except if we must
+    ///   send the dominant (0) ACK slot bit to let the transmitting nodes know that
+    ///   a node received their message on the wire.
     pub(crate) fn drive_bit(&mut self) -> Option<bool> {
         match self.state {
             NodeState::Transmitting => {
@@ -251,6 +303,10 @@ impl Node {
         }
     }
 
+    /// Take a relayed bit `wire` received from a node via a working CAN bus,
+    /// andreceive the bit and transmit a bit only if
+    /// `Node.state` is Transmitting and a frame has had
+    /// transmission prepared with [`crate::node::Node::prepare_transmission`]
     pub(crate) fn read_wire(&mut self, wire: bool) -> Result<(), ProtiumNodeError> {
         Node::receive_bit(
             self.receive_stream.get_or_insert_default(),
@@ -267,12 +323,22 @@ impl Node {
             ) {
                 Err(ProtiumNodeError::NodeLostTransmission) => {
                     self.state = NodeState::Receiving;
-                    self.transmit_stream = None;
+                    if !self.pending_retransmission() {
+                        self.queue_retransmission(true);
+                    }
+
+                    // self.set_state(NodeState::Receiving);
                     Ok(())
                 }
 
                 Err(e) => Err(e),
-                _ => Ok(()),
+                _ => {
+                    if self.pending_retransmission() {
+                        self.queue_retransmission(false);
+                    }
+
+                    Ok(())
+                }
             };
         }
 
