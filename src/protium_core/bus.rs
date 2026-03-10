@@ -98,29 +98,26 @@ impl Bus {
             // Check if any node needs to retransmit a frame.
             // If so, then we have more work to do on the bus and cannot go idle yet
             for node in self.nodes.iter_mut() {
+                if !node.is_active() {
+                    continue;
+                }
+
+                node.set_state(NodeState::Idle);
                 if node.pending_retransmission() {
                     node.set_state(NodeState::Transmitting);
                     keep_bus_active = true;
-                } else {
-                    if !node.is_active() {
-                        continue;
-                    }
-
-                    node.set_state(NodeState::Idle);
                 }
             }
 
             if !keep_bus_active {
-                self.state = BusState::Idle;
+                self.set_state(BusState::Idle);
             }
 
             return Ok(());
         }
 
         // update bus state
-        if self.state != BusState::Transmitting {
-            self.state = BusState::Transmitting;
-        }
+        self.set_state(BusState::Transmitting);
 
         // determine the winning bit
         // the winning bit will always be 0.
@@ -141,5 +138,12 @@ impl Bus {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn set_state(&mut self, state: BusState) {
+        if self.state == state {
+            return;
+        }
+        self.state = state;
     }
 }

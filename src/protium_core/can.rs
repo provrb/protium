@@ -371,7 +371,7 @@ impl EncodedFrame {
     /// Takes the 16 bits from the CRC field, drops the last bit (CRC delimeter - always 1),
     /// and converts the first 15-bits (checksum in bits) to a u16 (big endian).
     pub fn included_checksum(&self) -> Result<u16, ProtiumFrameError> {
-        let crc_bits = self.get_bit_field(&self.layout.crc_field);
+        let crc_bits = self.bit_field(&self.layout.crc_field);
 
         debug_assert_eq!(
             crc_bits.len(),
@@ -392,7 +392,7 @@ impl EncodedFrame {
         Ok(checksum_bits.load_be::<u16>())
     }
 
-    pub fn get_bit_field(&self, field_data: &FieldSpan) -> &BitSlice<u8, Msb0> {
+    pub fn bit_field(&self, field_data: &FieldSpan) -> &BitSlice<u8, Msb0> {
         let start_idx = field_data.start;
         let end_idx = field_data.end();
 
@@ -425,6 +425,51 @@ pub(crate) fn push_n_bits(dst: &mut WireBits, value: u32, nbits: usize) {
 
 pub(crate) fn push_byte(dst: &mut WireBits, byte: u8) {
     push_n_bits(dst, byte as u32, 8);
+}
+
+pub fn bit_stuff(bitstream: &BitVec<u32, Msb0>) -> BitVec<u32, Msb0> {
+    // insert a 0 after five consecutive 1s, or a 1 after five consecutive 0
+    let mut stuffed = BitVec::<u32, Msb0>::new();
+    let mut count = 0;
+    let mut last_bit: Option<bool> = None;
+    for bit in bitstream.iter() {
+        let curr_bit = *bit;        
+        if Some(curr_bit) == last_bit {
+            count += 1;
+        } else {
+            count = 1;
+        }
+
+        stuffed.push(curr_bit);
+        if count == 5 {
+            stuffed.push(!last_bit.unwrap());
+            count = 0;
+        }
+
+        last_bit = Some(curr_bit);
+    }
+
+    stuffed
+}
+
+pub(crate) fn bit_destuff(bitstream: &mut BitVec<u32, Msb0>) {
+    let reference_bitstream = bitstream.clone();
+    for (index, _) in reference_bitstream.iter().enumerate() {
+        // after every 5 identical bits insert an opposite bit
+
+        let start_idx = index;
+        let end_idx = if index + 5 > bitstream.len() {
+            bitstream.len()
+        } else {
+            index + 5
+        };
+        let next_five_bits = &bitstream[start_idx..end_idx];
+        if next_five_bits.all() {
+            bitstream.remove(end_idx);
+        } else if next_five_bits.not_any() {
+            bitstream.remove(end_idx);
+        }
+    }
 }
 
 impl Frame {

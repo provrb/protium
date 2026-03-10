@@ -1,5 +1,6 @@
 use crate::can::{
     CanId, Frame, ProtiumFrameError, WireBits, WireLayout, IDENTIFIER_EXTENSION_BIT_IDX,
+    MAX_EXTENDED_FRAME_SIZE_BITS,
 };
 use bitvec::{field::BitField, order::Msb0, vec::BitVec};
 use std::cmp::Ordering;
@@ -123,18 +124,14 @@ pub struct Node {
     can_id: CanId,
     /// Only process frames from other nodes with the following `CanId`'s
     filtered_can_ids: Vec<CanId>,
-    /// The current state of the node
     state: NodeState,
-    /// The current error state of the node
     error_state: NodeErrorState,
-    /// The amount of errors encountered on receive
     receive_error_counter: u16,
-    /// The amount of errors encountered on transmission
     transmit_error_counter: u16,
-    /// A stream created when transmitting a CAN frame on a CAN bus
     transmit_stream: Option<TransmitStream>,
-    /// A stream created when receiving data on a CAN bus
     receive_stream: Option<ReceiveStream>,
+    on_complete_receive_callback: Option<fn(node_id: CanId, received_bits: &WireBits)>,
+    on_complete_transmit_callback: Option<fn()>,
 }
 
 impl PartialEq for Node {
@@ -156,6 +153,9 @@ impl Node {
 
             transmit_stream: None,
             receive_stream: None,
+
+            on_complete_receive_callback: None,
+            on_complete_transmit_callback: None,
         }
     }
 
@@ -212,8 +212,7 @@ impl Node {
         &self.filtered_can_ids
     }
 
-    /// Get a reference to a Node's most recently received bits
-    pub fn received_bits(&self) -> Option<&WireBits> {
+    pub fn last_received_bits(&self) -> Option<&WireBits> {
         self.receive_stream.as_ref().map(|rs| &rs.bits)
     }
 
@@ -251,6 +250,14 @@ impl Node {
         }
     }
 
+    /// Tells the node to run a function, `callback` everytime a receive operation is fully completed.
+    ///
+    /// NOTE: If a receive callback is set for the function, after a receive is fully completed,
+    /// `self.receive_stream` will be set to None and thus [`Node::received_bits()`] will also yield None.
+    pub fn set_on_complete_receive_callback(&mut self, callback: fn(CanId, &WireBits)) {
+        self.on_complete_receive_callback = Some(callback)
+    }
+
     pub(crate) fn queue_retransmission(&mut self, queue: bool) {
         if let Some(ts) = self.transmit_stream.as_mut() {
             ts.pending_retransmit = queue;
@@ -261,11 +268,27 @@ impl Node {
         }
     }
 
-    /// Sets the current state of the node
+    /// Sets the current state of the node.
+    ///
+    /// If there is a callback function for a complete receive and
+    /// `self.state` `==` `NodeState::Receiving`` but `state` is not `NodeState::Receiving`
+    /// assume the receiving has ended, run the callback if there is any
+    /// (set with [`crate::node:Node::set_on_complete_receive_callback`]),
+    /// and then clear the `receive_stream`
     pub(crate) fn set_state(&mut self, state: NodeState) {
-        if state == NodeState::Receiving || state == NodeState::Transmitting {
-            // switching to receiving/transmitting so clear/prepare receive_stream
+        if self.state == state {
+            return;
+        }
+
+        if self.state == NodeState::Idle {
             self.receive_stream = None;
+        }
+
+        // println!("[Node:{}] Setting state from: {:?} to {:?}", self.can_id, self.state, state);
+        if let Some(received_bits) = self.receive_stream.as_ref().map(|rs| &rs.bits) {
+            if let Some(received_callback) = self.on_complete_receive_callback.as_ref() {
+                received_callback(self.can_id, received_bits);
+            }
         }
 
         self.state = state
@@ -309,7 +332,15 @@ impl Node {
     /// transmission prepared with [`crate::node::Node::prepare_transmission`]
     pub(crate) fn read_wire(&mut self, wire: bool) -> Result<(), ProtiumNodeError> {
         Node::receive_bit(
-            self.receive_stream.get_or_insert_default(),
+            self.receive_stream.get_or_insert(ReceiveStream {
+                bits: WireBits::with_capacity(MAX_EXTENDED_FRAME_SIZE_BITS),
+                rc_idx: 0,
+                pending_ack: false,
+                is_extended_frame: false,
+                frame_dlc_bits: WireBits::with_capacity(4),
+                frame_data_length: None,
+                frame_layout: None,
+            }),
             wire,
             self.state,
         );
