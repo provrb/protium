@@ -131,7 +131,7 @@ pub struct Node {
     transmit_stream: Option<TransmitStream>,
     receive_stream: Option<ReceiveStream>,
     on_complete_receive_callback: Option<fn(node_id: CanId, received_bits: &WireBits)>,
-    on_complete_transmit_callback: Option<fn()>,
+    on_complete_transmit_callback: Option<fn(node_id: CanId)>,
 }
 
 impl PartialEq for Node {
@@ -258,6 +258,10 @@ impl Node {
         self.on_complete_receive_callback = Some(callback)
     }
 
+    pub fn set_on_complete_tranmission_callback(&mut self, callback: fn(CanId)) {
+        self.on_complete_transmit_callback = Some(callback)
+    }
+
     pub(crate) fn queue_retransmission(&mut self, queue: bool) {
         if let Some(ts) = self.transmit_stream.as_mut() {
             ts.pending_retransmit = queue;
@@ -280,11 +284,17 @@ impl Node {
             return;
         }
 
+        if self.state == NodeState::Transmitting {
+            // stop transmitting
+            if let Some(transmitted_callback) = self.on_complete_transmit_callback.as_ref() {
+                transmitted_callback(self.can_id);
+            }
+        }
+
         if self.state == NodeState::Idle {
             self.receive_stream = None;
         }
 
-        // println!("[Node:{}] Setting state from: {:?} to {:?}", self.can_id, self.state, state);
         if let Some(received_bits) = self.receive_stream.as_ref().map(|rs| &rs.bits) {
             if let Some(received_callback) = self.on_complete_receive_callback.as_ref() {
                 received_callback(self.can_id, received_bits);
@@ -378,6 +388,23 @@ impl Node {
 
     fn receive_bit(rc_stream: &mut ReceiveStream, bit: bool, node_state: NodeState) {
         let rc_idx = rc_stream.rc_idx;
+        
+        // check bit stuffing
+        // check the last 5 bits, if they are the same and this one is different then skip receiving this bit
+        
+        // let last_5_idx = rc_idx.saturating_sub(5);
+        // // println!("last 5 idx: {}. rc idx: {}", last_5_idx, rc_idx);
+        // if rc_idx - last_5_idx == 5 {
+        //     let Some(last_5_bits) = rc_stream.bits.get(last_5_idx..rc_idx) else {
+        //         return;
+        //     };
+        //     // println!("last 5 bits: {:?}", last_5_bits);
+        //     if (last_5_bits.all() && bit == false) || (last_5_bits.not_any() && bit == true) {
+        //         // stuff bit
+        //         // println!("current bit: {} is a stuff bit", bit);
+        //         return;
+        //     }
+        // }
 
         // goal: check if this is an ack slot to set the bit to 0
         // construct a wire layout based on the bits we receive

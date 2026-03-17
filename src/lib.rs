@@ -198,16 +198,65 @@ mod tests {
 
     #[test]
     fn bit_stuffing() {
-        assert_eq!(bit_stuff(&bitvec![u32, Msb0; 1,1,1,1,1]), bitvec![u32, Msb0; 1,1,1,1,1,0]);
-        assert_eq!(bit_stuff(&bitvec![u32, Msb0; 0,0,0,0,0,1]), bitvec![u32, Msb0; 0,0,0,0,0,1,1]);
-        assert_eq!(bit_stuff(&bitvec![u32, Msb0; 1,1,1,1,1,1]), bitvec![u32, Msb0; 1,1,1,1,1,0,1]);
-        assert_eq!(bit_stuff(&bitvec![u32, Msb0; 1,1,1,1,1,1,1]), bitvec![u32, Msb0; 1,1,1,1,1,0,1,1]);
-        assert_eq!(bit_stuff(&bitvec![u32, Msb0; 1,1,1,1,1,0,0]), bitvec![u32, Msb0; 1,1,1,1,1,0,0,0]);
-        assert_eq!(bit_stuff(&bitvec![u32, Msb0; 0,0,0,0,0,1,1]), bitvec![u32, Msb0; 0,0,0,0,0,1,1,1]);
-        assert_eq!(bit_stuff(&bitvec![u32, Msb0; 1,1,1,1,1,1,0,0,0,0,0]), bitvec![u32, Msb0; 1,1,1,1,1,0,1,0,0,0,0,0,1]);
-        assert_eq!(bit_stuff(&bitvec![u32, Msb0; 1,0,1,1,1,1,1,0]), bitvec![u32, Msb0; 1,0,1,1,1,1,1,0,0]);
-        assert_eq!(bit_stuff(&bitvec![u32, Msb0; 0,1,0,0,0,0,0,1]), bitvec![u32, Msb0; 0,1,0,0,0,0,0,1,1]);
-        assert_eq!(bit_stuff(&bitvec![u32, Msb0; 1,1,1,1,1,0,1,1,1,1,1]), bitvec![u32, Msb0; 1,1,1,1,1,0,0,1,1,1,1,1,0]);
-        assert_eq!(bit_stuff(&bitvec![u32, Msb0; 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]), bitvec![u32, Msb0; 1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0]);
+        assert_eq!(
+            bit_stuff(&bitvec![u8, Msb0; 1,1,1,1,1]),
+            bitvec![u32, Msb0; 1,1,1,1,1,0]
+        );
+        assert_eq!(
+            bit_stuff(&bitvec![u8, Msb0; 0,0,0,0,0,1]),
+            bitvec![u32, Msb0; 0,0,0,0,0,1,1]
+        );
+        assert_eq!(
+            bit_stuff(&bitvec![u8, Msb0; 1,1,1,1,1,1]),
+            bitvec![u32, Msb0; 1,1,1,1,1,0,1]
+        );
+        assert_eq!(
+            bit_stuff(&bitvec![u8, Msb0; 1,1,1,1,1,1,1]),
+            bitvec![u32, Msb0; 1,1,1,1,1,0,1,1]
+        );
+        assert_eq!(
+            bit_stuff(&bitvec![u8, Msb0; 1,1,1,1,1,0,0]),
+            bitvec![u32, Msb0; 1,1,1,1,1,0,0,0]
+        );
+        assert_eq!(
+            bit_stuff(&bitvec![u8, Msb0; 0,0,0,0,0,1,1]),
+            bitvec![u32, Msb0; 0,0,0,0,0,1,1,1]
+        );
+        assert_eq!(
+            bit_stuff(&bitvec![u8, Msb0; 1,0,1,1,1,1,1,0]),
+            bitvec![u32, Msb0; 1,0,1,1,1,1,1,0,0]
+        );
+        assert_eq!(
+            bit_stuff(&bitvec![u8, Msb0; 0,1,0,0,0,0,0,1]),
+            bitvec![u32, Msb0; 0,1,0,0,0,0,0,1,1]
+        );
+        assert_eq!(
+            bit_stuff(&bitvec![u8, Msb0; 1,1,1,1,1,0,1,1,1,1,1]),
+            bitvec![u32, Msb0; 1,1,1,1,1,0,0,1,1,1,1,1,0]
+        );
+        assert_eq!(
+            bit_stuff(&bitvec![u8, Msb0; 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]),
+            bitvec![u32, Msb0; 1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0]
+        );
+    }
+
+    #[test]
+    fn bit_destuffing() {
+        assert_eq!(
+            bit_destuff(&bitvec![u8, Msb0; 1,1,1,1,1,0]),
+            bitvec![u32, Msb0; 1,1,1,1,1]
+        );
+        assert_eq!(
+            bit_destuff(&bitvec![u8, Msb0; 0,0,0,0,0,1,1]),
+            bitvec![u32, Msb0; 0,0,0,0,0,1]
+        );
+        assert_eq!(
+            bit_destuff(&bitvec![u8, Msb0; 1,1,1,1,1,0,1,1]),
+            bitvec![u32, Msb0; 1,1,1,1,1,1,1]
+        );
+        assert_eq!(
+            bit_destuff(&bitvec![u8, Msb0; 1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0]),
+            bitvec![u32, Msb0; 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+        );
     }
 }

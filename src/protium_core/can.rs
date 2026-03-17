@@ -1,5 +1,5 @@
 use bitvec::prelude::*;
-use std::{fmt::Display, ops::RangeInclusive};
+use std::{fmt::Display, io::Read, ops::RangeInclusive};
 use thiserror::Error;
 
 /// The generator polynomial constant used for CRC-15 (used by CAN) checksum
@@ -427,13 +427,13 @@ pub(crate) fn push_byte(dst: &mut WireBits, byte: u8) {
     push_n_bits(dst, byte as u32, 8);
 }
 
-pub fn bit_stuff(bitstream: &BitVec<u32, Msb0>) -> BitVec<u32, Msb0> {
+pub fn bit_stuff(bitstream: &BitVec<u8, Msb0>) -> BitVec<u8, Msb0> {
     // insert a 0 after five consecutive 1s, or a 1 after five consecutive 0
-    let mut stuffed = BitVec::<u32, Msb0>::new();
+    let mut stuffed = BitVec::<u8, Msb0>::new();
     let mut count = 0;
     let mut last_bit: Option<bool> = None;
     for bit in bitstream.iter() {
-        let curr_bit = *bit;        
+        let curr_bit = *bit;
         if Some(curr_bit) == last_bit {
             count += 1;
         } else {
@@ -452,24 +452,28 @@ pub fn bit_stuff(bitstream: &BitVec<u32, Msb0>) -> BitVec<u32, Msb0> {
     stuffed
 }
 
-pub(crate) fn bit_destuff(bitstream: &mut BitVec<u32, Msb0>) {
-    let reference_bitstream = bitstream.clone();
-    for (index, _) in reference_bitstream.iter().enumerate() {
-        // after every 5 identical bits insert an opposite bit
-
-        let start_idx = index;
-        let end_idx = if index + 5 > bitstream.len() {
-            bitstream.len()
+pub fn bit_destuff(bitstream: &BitVec<u8, Msb0>) -> BitVec<u8, Msb0> {
+    let mut count = 0;
+    let mut last_bit: Option<bool> = None;
+    let mut destuffed = BitVec::<u8, Msb0>::new();
+    for bit in bitstream.iter() {
+        let curr_bit = *bit;
+        if count < 5 {
+            destuffed.push(curr_bit);
         } else {
-            index + 5
-        };
-        let next_five_bits = &bitstream[start_idx..end_idx];
-        if next_five_bits.all() {
-            bitstream.remove(end_idx);
-        } else if next_five_bits.not_any() {
-            bitstream.remove(end_idx);
+            count = 1;
         }
+
+        if Some(curr_bit) == last_bit {
+            count += 1;
+        } else {
+            count = 1;
+        }
+
+        last_bit = Some(curr_bit);
     }
+
+    destuffed
 }
 
 impl Frame {
@@ -526,7 +530,6 @@ impl Frame {
     pub fn checksum(&self) -> Result<u16, ProtiumFrameError> {
         // checksum = input data (as a binary stream) % generator constant
         let input_data = self.create_checksum_input_stream()?;
-        // println!("Running checksum on frame object. input data: {}", input_data);
         Frame::checksum_with_input(&input_data)
     }
 
@@ -568,18 +571,22 @@ impl Frame {
         // For standard frames contains:
         // 1. 11 Bit CAN ID
         // 2. Remote transmission request (RTR) bit
-        if self.is_extended() {
-            let split_id = self.id().split_extended_id()?;
+        let mut arbitration_field_bits = WireBits::new();
+        match self.can_id {
+            CanId::Standard(base_11_id) => {
+                push_n_bits(&mut arbitration_field_bits, base_11_id as u32, 11);
+                arbitration_field_bits.push(self.is_remote_request); // Remote transmission request RTR bit
+            }
+            CanId::Extended(_) => {
+                let extended_id_split = self.can_id.split_extended_id()?;
 
-            push_n_bits(&mut bitstream, split_id.base_11_id as u32, 11); // 1. 11 bit CAN ID
-            bitstream.push(true); // 2. SRR bit - always 1
-            bitstream.push(true); // 3. IDE bit - 1 because this is an extended frame
-
-            push_n_bits(&mut bitstream, split_id.ext_18_id, 18); // 4. 18 bit CAN ID
-        } else {
-            push_n_bits(&mut bitstream, self.id().as_u32(), 11); // 1. 11 bit CAN ID
+                push_n_bits(&mut arbitration_field_bits, extended_id_split.base_11_id as u32, 11);
+                arbitration_field_bits.push(true); // SRR bit, always 1
+                arbitration_field_bits.push(true); // Idetifier extension bit (IDE), always 1 for ext frame
+                push_n_bits(&mut arbitration_field_bits, extended_id_split.ext_18_id, 18);
+                arbitration_field_bits.push(self.is_remote_request); // Remote transmission request RTR bit
+            }
         }
-        bitstream.push(self.is_remote_request()); // RTR bit
 
         // Control Field
         //
@@ -587,33 +594,59 @@ impl Frame {
         //    or r0 bit (which is also always 0) for extended frames
         // 2. r1 bit (always 0)
         // 3. Data length code (DLC), 4 bits long. Tells the size of the payload in bytes.
-        bitstream.push(false); // 1. IDE/r0 bit (always 0)
-        bitstream.push(false); // 2. r1 bit (always 0)
-        push_n_bits(&mut bitstream, self.data_length_bytes() as u32, 4); // 3. DLC
+        let mut control_field_bits = WireBits::with_capacity(6);
+        control_field_bits.push(false); // 1. IDE/r0 bit (always 0)
+        control_field_bits.push(false); // 2. r1 bit (always 0)
+        push_n_bits(&mut control_field_bits, self.data_length_bytes() as u32, 4); // 3. DLC
 
         // Data Field
         // Push all bytes of data into the bitstream as bits
+        let mut data_field_bits = WireBits::new();
         for byte in self.data() {
-            push_byte(&mut bitstream, *byte);
+            push_byte(&mut data_field_bits, *byte);
         }
+
+        bitstream.append(&mut arbitration_field_bits);
+        bitstream.append(&mut control_field_bits);
+        bitstream.append(&mut data_field_bits);
 
         // CRC Field
         // Contains:
         // 1. 15 bit long CRC-15 CAN checksum
         // 2. CRC delimeter bit (always 1)
-        push_n_bits(&mut bitstream, self.checksum()? as u32, 15); // 1. checksum
-        bitstream.push(true); // 2. CRC delimeter - comes after checksum bits
+        let mut crc_field = WireBits::with_capacity(16);
+        
+        {
+            let mut padded = bitstream.clone();
+            push_n_bits(&mut padded, 0, 15);
+    
+            let checksum = Self::checksum_with_input(&padded)?;
+    
+            push_n_bits(
+                &mut crc_field,
+                checksum as u32,
+                15,
+            ); // 1. checksum
+        }
+
+        crc_field.push(true); // 2. CRC delimeter - comes after checksum bits
 
         // Acknowledgement (ACK) Field
         // Contains:
         // 1. ACK slot bit. Transmitters set this bit to 1 and
         //    receivers set this bit to 0.
-        bitstream.push(true); // 1. ack slot. transmitter sets to 1
-        bitstream.push(true); // 2. ack delimeter - always 1
+        // 2. ACK delimeter
+        let mut ack_field = bitvec![u8, Msb0; 1, 1];
 
         // End of Frame (EOF) field.
         // Contains 7 recessive bits at the end of the frame
-        bitstream.extend([true].repeat(7));
+        let mut eof_field = bitvec![u8, Msb0; 1,1,1,1,1,1,1];
+        bitstream.append(&mut crc_field);
+        bitstream.append(&mut ack_field);
+        bitstream.append(&mut eof_field);
+
+        println!("encoded: {:?}", bitstream);
+
         Ok(bitstream)
     }
 
@@ -653,8 +686,9 @@ impl Frame {
         for byte in self.data() {
             push_byte(&mut input_data, *byte);
         }
-
         push_n_bits(&mut input_data, 0, 15);
+
+        println!("\tchecksum input created: {:?}", input_data);
 
         Ok(input_data)
     }
