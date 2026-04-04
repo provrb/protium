@@ -1,5 +1,5 @@
 use bitvec::prelude::*;
-use std::{fmt::Display, io::Read, ops::RangeInclusive};
+use std::{fmt::Display, ops::RangeInclusive};
 use thiserror::Error;
 
 /// The generator polynomial constant used for CRC-15 (used by CAN) checksum
@@ -427,55 +427,6 @@ pub(crate) fn push_byte(dst: &mut WireBits, byte: u8) {
     push_n_bits(dst, byte as u32, 8);
 }
 
-pub fn bit_stuff(bitstream: &BitVec<u8, Msb0>) -> BitVec<u8, Msb0> {
-    // insert a 0 after five consecutive 1s, or a 1 after five consecutive 0
-    let mut stuffed = BitVec::<u8, Msb0>::new();
-    let mut count = 0;
-    let mut last_bit: Option<bool> = None;
-    for bit in bitstream.iter() {
-        let curr_bit = *bit;
-        if Some(curr_bit) == last_bit {
-            count += 1;
-        } else {
-            count = 1;
-        }
-
-        stuffed.push(curr_bit);
-        if count == 5 {
-            stuffed.push(!last_bit.unwrap());
-            count = 0;
-        }
-
-        last_bit = Some(curr_bit);
-    }
-
-    stuffed
-}
-
-pub fn bit_destuff(bitstream: &BitVec<u8, Msb0>) -> BitVec<u8, Msb0> {
-    let mut count = 0;
-    let mut last_bit: Option<bool> = None;
-    let mut destuffed = BitVec::<u8, Msb0>::new();
-    for bit in bitstream.iter() {
-        let curr_bit = *bit;
-        if count < 5 {
-            destuffed.push(curr_bit);
-        } else {
-            count = 1;
-        }
-
-        if Some(curr_bit) == last_bit {
-            count += 1;
-        } else {
-            count = 1;
-        }
-
-        last_bit = Some(curr_bit);
-    }
-
-    destuffed
-}
-
 impl Frame {
     /// Create a new frame with payload data `payload`
     ///
@@ -527,12 +478,17 @@ impl Frame {
         }
     }
 
+    /// Generate a u16 CRC-15 checksum from this frame
+    ///
+    /// The checksum binary input data consists of: SOF bit (always 0) | Arbitration field | Control field | Data field
     pub fn checksum(&self) -> Result<u16, ProtiumFrameError> {
         // checksum = input data (as a binary stream) % generator constant
         let input_data = self.create_checksum_input_stream()?;
         Frame::checksum_with_input(&input_data)
     }
 
+    /// Perform the CRC-15 checksum algorithm on the given input data.
+    /// Note: the function assumes `input_data` has the correct 15 0-bit padding
     pub fn checksum_with_input(input_data: &BitVec<u8, Msb0>) -> Result<u16, ProtiumFrameError> {
         let mut crc = 0;
         for bit in input_data {
@@ -550,6 +506,7 @@ impl Frame {
         Ok(checksum)
     }
 
+    /// Converts the abstracted Frame object into a CAN accurate encoded bitstream frame
     pub fn encode(&self) -> Result<WireBits, ProtiumFrameError> {
         let capacity = if self.is_extended() {
             MAX_EXTENDED_FRAME_SIZE_BITS
@@ -580,7 +537,11 @@ impl Frame {
             CanId::Extended(_) => {
                 let extended_id_split = self.can_id.split_extended_id()?;
 
-                push_n_bits(&mut arbitration_field_bits, extended_id_split.base_11_id as u32, 11);
+                push_n_bits(
+                    &mut arbitration_field_bits,
+                    extended_id_split.base_11_id as u32,
+                    11,
+                );
                 arbitration_field_bits.push(true); // SRR bit, always 1
                 arbitration_field_bits.push(true); // Idetifier extension bit (IDE), always 1 for ext frame
                 push_n_bits(&mut arbitration_field_bits, extended_id_split.ext_18_id, 18);
@@ -615,18 +576,14 @@ impl Frame {
         // 1. 15 bit long CRC-15 CAN checksum
         // 2. CRC delimeter bit (always 1)
         let mut crc_field = WireBits::with_capacity(16);
-        
+
         {
             let mut padded = bitstream.clone();
             push_n_bits(&mut padded, 0, 15);
-    
+
             let checksum = Self::checksum_with_input(&padded)?;
-    
-            push_n_bits(
-                &mut crc_field,
-                checksum as u32,
-                15,
-            ); // 1. checksum
+
+            push_n_bits(&mut crc_field, checksum as u32, 15); // 1. checksum
         }
 
         crc_field.push(true); // 2. CRC delimeter - comes after checksum bits
@@ -687,8 +644,6 @@ impl Frame {
             push_byte(&mut input_data, *byte);
         }
         push_n_bits(&mut input_data, 0, 15);
-
-        println!("\tchecksum input created: {:?}", input_data);
 
         Ok(input_data)
     }

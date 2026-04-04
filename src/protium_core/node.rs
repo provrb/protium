@@ -251,13 +251,11 @@ impl Node {
     }
 
     /// Tells the node to run a function, `callback` everytime a receive operation is fully completed.
-    ///
-    /// NOTE: If a receive callback is set for the function, after a receive is fully completed,
-    /// `self.receive_stream` will be set to None and thus [`Node::received_bits()`] will also yield None.
     pub fn set_on_complete_receive_callback(&mut self, callback: fn(CanId, &WireBits)) {
         self.on_complete_receive_callback = Some(callback)
     }
 
+    /// Tells the node to run a function, `callback` everytime a transmission operation is fully completed.
     pub fn set_on_complete_tranmission_callback(&mut self, callback: fn(CanId)) {
         self.on_complete_transmit_callback = Some(callback)
     }
@@ -388,23 +386,6 @@ impl Node {
 
     fn receive_bit(rc_stream: &mut ReceiveStream, bit: bool, node_state: NodeState) {
         let rc_idx = rc_stream.rc_idx;
-        
-        // check bit stuffing
-        // check the last 5 bits, if they are the same and this one is different then skip receiving this bit
-        
-        // let last_5_idx = rc_idx.saturating_sub(5);
-        // // println!("last 5 idx: {}. rc idx: {}", last_5_idx, rc_idx);
-        // if rc_idx - last_5_idx == 5 {
-        //     let Some(last_5_bits) = rc_stream.bits.get(last_5_idx..rc_idx) else {
-        //         return;
-        //     };
-        //     // println!("last 5 bits: {:?}", last_5_bits);
-        //     if (last_5_bits.all() && bit == false) || (last_5_bits.not_any() && bit == true) {
-        //         // stuff bit
-        //         // println!("current bit: {} is a stuff bit", bit);
-        //         return;
-        //     }
-        // }
 
         // goal: check if this is an ack slot to set the bit to 0
         // construct a wire layout based on the bits we receive
@@ -460,12 +441,10 @@ impl Node {
 
     fn transmit_bit(ts_stream: &mut TransmitStream, wire: bool) -> Result<(), ProtiumNodeError> {
         // the current bit idx of what bit to transmit next
-        // therefore, last bit idx is ts_idx - 1
         let ts_idx = ts_stream.ts_idx;
         let last_ts_idx = ts_idx.saturating_sub(1);
+
         let Some(last_sent) = ts_stream.bits.get(last_ts_idx) else {
-            // the only time we wont have a reference to the last sent bit is if we are sending the first bit.
-            // in this case its fine to return since we do not need to compute anything else
             return Ok(());
         };
 

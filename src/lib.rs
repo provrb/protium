@@ -7,10 +7,10 @@ pub use protium_core::*;
 /// Unit tests
 #[cfg(test)]
 mod tests {
-    use crate::{bus::Bus, node::Node};
+    use crate::{bit_destuff, bit_stuff, bus::Bus, node::Node};
 
     use super::protium_core::can::*;
-    use bitvec::{bitarr, bits, bitvec, order::Msb0, slice::BitSlice, vec::BitVec};
+    use bitvec::{bitvec, order::Msb0, vec::BitVec};
 
     // CRC-15 CAN checksum computation test
     #[test]
