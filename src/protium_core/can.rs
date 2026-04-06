@@ -602,8 +602,6 @@ impl Frame {
         bitstream.append(&mut ack_field);
         bitstream.append(&mut eof_field);
 
-        println!("encoded: {:?}", bitstream);
-
         Ok(bitstream)
     }
 

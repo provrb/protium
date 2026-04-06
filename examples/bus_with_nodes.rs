@@ -1,5 +1,9 @@
+use protium::{
+    bus::Bus,
+    can::{CanId, Frame},
+    node::Node,
+};
 use std::{thread::sleep, time::Duration};
-use protium::{bus::Bus, can::{CanId, Frame}, node::Node};
 
 /// This example demonstrates a bus with two nodes registered
 /// One node will transmit data over the bus to all nodes on the bus
@@ -46,11 +50,6 @@ fn main() {
 
     // Print all received bits for all nodes
     for node in bus.get_nodes().iter() {
-        println!(
-            "[Node:{}] State: {:?} - Received bits: `{:?}`",
-            node.id(),
-            node.state(),
-            node.last_received_bits()
-        );
+        println!("[Node:{}] State: {:?}", node.id(), node.state(),);
     }
 }

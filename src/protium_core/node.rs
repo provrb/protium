@@ -1,6 +1,9 @@
-use crate::can::{
-    CanId, Frame, ProtiumFrameError, WireBits, WireLayout, IDENTIFIER_EXTENSION_BIT_IDX,
-    MAX_EXTENDED_FRAME_SIZE_BITS,
+use crate::{
+    can::{
+        CanId, Frame, ProtiumFrameError, WireBits, WireLayout, IDENTIFIER_EXTENSION_BIT_IDX,
+        MAX_EXTENDED_FRAME_SIZE_BITS,
+    },
+    printerr,
 };
 use bitvec::{field::BitField, order::Msb0, vec::BitVec};
 use std::cmp::Ordering;
@@ -212,8 +215,39 @@ impl Node {
         &self.filtered_can_ids
     }
 
-    pub fn last_received_bits(&self) -> Option<&WireBits> {
-        self.receive_stream.as_ref().map(|rs| &rs.bits)
+    pub(crate) fn set_idle(&mut self) {
+        if self.state == NodeState::Transmitting {
+            if let Some(transmitted_callback) = self.on_complete_transmit_callback.as_ref() {
+                transmitted_callback(self.can_id);
+            }
+        }
+
+        if let Some(received_bits) = self.receive_stream.as_ref().map(|rs| &rs.bits) {
+            if let Some(received_callback) = self.on_complete_receive_callback.as_ref() {
+                received_callback(self.can_id, received_bits);
+            }
+        }
+
+        self.state = NodeState::Idle;
+    }
+
+    pub(crate) fn set_transmitting(&mut self) {
+        if self.state == NodeState::Receiving {
+            if let Some(received_bits) = self.receive_stream.as_ref().map(|rs| &rs.bits) {
+                if let Some(received_callback) = self.on_complete_receive_callback.as_ref() {
+                    received_callback(self.can_id, received_bits);
+                }
+            }
+        }
+
+        self.transmit_stream = None;
+        self.state = NodeState::Transmitting;
+    }
+
+    pub(crate) fn set_receiving(&mut self) {
+        self.transmit_stream = None;
+        self.receive_stream = None;
+        self.state = NodeState::Receiving;
     }
 
     /// Encode and prepare the transmission of `frame` via CAN bus to allow the node
@@ -270,38 +304,6 @@ impl Node {
         }
     }
 
-    /// Sets the current state of the node.
-    ///
-    /// If there is a callback function for a complete receive and
-    /// `self.state` `==` `NodeState::Receiving`` but `state` is not `NodeState::Receiving`
-    /// assume the receiving has ended, run the callback if there is any
-    /// (set with [`crate::node:Node::set_on_complete_receive_callback`]),
-    /// and then clear the `receive_stream`
-    pub(crate) fn set_state(&mut self, state: NodeState) {
-        if self.state == state {
-            return;
-        }
-
-        if self.state == NodeState::Transmitting {
-            // stop transmitting
-            if let Some(transmitted_callback) = self.on_complete_transmit_callback.as_ref() {
-                transmitted_callback(self.can_id);
-            }
-        }
-
-        if self.state == NodeState::Idle {
-            self.receive_stream = None;
-        }
-
-        if let Some(received_bits) = self.receive_stream.as_ref().map(|rs| &rs.bits) {
-            if let Some(received_callback) = self.on_complete_receive_callback.as_ref() {
-                received_callback(self.can_id, received_bits);
-            }
-        }
-
-        self.state = state
-    }
-
     /// Determine what bit to send based on a couple factors.
     ///
     /// - If the node is currently transmitting, send the next bit in the transmission bitstream
@@ -339,6 +341,12 @@ impl Node {
     /// `Node.state` is Transmitting and a frame has had
     /// transmission prepared with [`crate::node::Node::prepare_transmission`]
     pub(crate) fn read_wire(&mut self, wire: bool) -> Result<(), ProtiumNodeError> {
+        // if the bus is idle it will send recessive (1/true) bits
+        let rc_stream = &self.receive_stream;
+        if rc_stream.is_none() && wire {
+            return Ok(());
+        }
+
         Node::receive_bit(
             self.receive_stream.get_or_insert(ReceiveStream {
                 bits: WireBits::with_capacity(MAX_EXTENDED_FRAME_SIZE_BITS),
@@ -416,22 +424,36 @@ impl Node {
             if rc_idx + 1 == layout.acknowledgement_field.start
                 && node_state == NodeState::Receiving
             {
-                // verify crc checksum
-                let received_checksum = rc_stream
+                let received_checksum: u16 = match rc_stream
                     .bits
                     .get(layout.data_field.end()..layout.crc_field.end() - 1)
-                    .expect("Node received checksum is not valid")
-                    .load_be();
+                {
+                    Some(checksum) => checksum.load_be(),
+                    None => {
+                        printerr!("failed to construct received checksum from bitslice - diagnostic information: \n`layout`: {:#?}", layout);
+                        return;
+                    }
+                };
 
-                let mut checksum_input = rc_stream
-                    .bits
-                    .get(0..layout.data_field.end())
-                    .expect("cannot get checksum input bits for some reason")
-                    .to_bitvec();
+                let mut checksum_input = match rc_stream.bits.get(0..layout.data_field.end()) {
+                    Some(input) => input.to_bitvec(),
+                    None => {
+                        printerr!("failed to construct checksum INPUT to calculate checksum from bitslice: `0..layout.data_field.end()` - `layout`: {:#?}", layout);
+                        return;
+                    }
+                };
+
                 checksum_input.append(&mut BitVec::<u8, Msb0>::repeat(false, 15));
 
-                let calculated_checksum = Frame::checksum_with_input(&checksum_input).unwrap();
-                rc_stream.pending_ack = calculated_checksum == received_checksum;
+                match Frame::checksum_with_input(&checksum_input) {
+                    Ok(calculated_checksum) => {
+                        rc_stream.pending_ack = calculated_checksum == received_checksum;
+                    }
+                    Err(e) => {
+                        printerr!("call to `Frame::checksum_with_input` calculating checksum with input `{}` failed - error: `{}`", checksum_input, e);
+                        return;
+                    }
+                }
             }
         }
 

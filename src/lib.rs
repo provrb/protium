@@ -1,3 +1,4 @@
+mod logging;
 /// Modules
 mod protium_core;
 
@@ -100,7 +101,7 @@ mod tests {
         let tcm_id = CanId::Standard(0x7EA);
 
         let mut ecm = Node::new(ecm_id);
-        let tcm = Node::new(tcm_id);
+        let mut tcm = Node::new(tcm_id);
 
         let engine_oil_temperature = vec![0x22];
         let engine_oil_frame = Frame::new(ecm.id(), engine_oil_temperature, false)
@@ -109,6 +110,24 @@ mod tests {
         // prepare nodes to transmit their data when the bus is active
         ecm.queue_transmission(&engine_oil_frame)
             .expect("failed to prepare transmission frame for ECM");
+        ecm.set_on_complete_receive_callback(|can_id, bits| {
+            let engine_oil_temperature = vec![0x22];
+            let engine_oil_frame = Frame::new(can_id, engine_oil_temperature, false)
+                .expect("failed to create example engine oil frame");
+            let expected_received_bits: BitVec<u8, Msb0> = engine_oil_frame.encode().unwrap();
+
+            assert_eq!(bits.len(), expected_received_bits.len());
+        });
+
+        tcm.set_on_complete_receive_callback(|_, bits| {
+            let engine_oil_temperature = vec![0x22];
+            let engine_oil_frame =
+                Frame::new(CanId::Standard(0x7E8), engine_oil_temperature, false)
+                    .expect("failed to create example engine oil frame");
+            let expected_received_bits: BitVec<u8, Msb0> = engine_oil_frame.encode().unwrap();
+
+            assert_eq!(bits.len(), expected_received_bits.len());
+        });
 
         // register nodes on bus to send/receive
         bus.register_node(ecm);
@@ -122,26 +141,6 @@ mod tests {
                 break;
             }
         }
-
-        // check if both modules have received the message sent by tcm
-        let expected_received_bits = engine_oil_frame.encode().unwrap();
-        assert_eq!(
-            bus.get_node(ecm_id)
-                .unwrap()
-                .last_received_bits()
-                .unwrap()
-                .len(),
-            expected_received_bits.len(),
-        );
-
-        assert_eq!(
-            bus.get_node(tcm_id)
-                .unwrap()
-                .last_received_bits()
-                .unwrap()
-                .len(),
-            expected_received_bits.len(),
-        );
     }
 
     #[test]

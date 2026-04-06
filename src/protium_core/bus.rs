@@ -35,7 +35,7 @@ impl Bus {
 
     /// Check if the current Bus is Active/Transmitting bits to nodes on the wire
     pub fn is_active(&self) -> bool {
-        self.state == BusState::Transmitting
+        self.state != BusState::Idle
     }
 
     /// Register a [`crate::node::Node`] on the current bus to be able to
@@ -91,7 +91,7 @@ impl Bus {
         // Set all listening/previously transmitting Nodes to idle
         // Set bus state to idle
         if bits_to_drive_this_tick.is_empty() {
-            let mut keep_bus_active = false;
+            let mut nodes_retransmitting = false;
 
             // Before setting the bus to idle and concluding there
             // is no work for the bus to do.
@@ -102,36 +102,44 @@ impl Bus {
                     continue;
                 }
 
-                node.set_state(NodeState::Idle);
+                node.set_idle();
+
                 if node.pending_retransmission() {
-                    node.set_state(NodeState::Transmitting);
-                    keep_bus_active = true;
+                    node.set_transmitting();
+                    nodes_retransmitting = true;
                 }
             }
 
-            if !keep_bus_active {
-                self.set_state(BusState::Idle);
+            if nodes_retransmitting {
+                self.state = BusState::Transmitting;
+                return Ok(());
             }
 
-            return Ok(());
+            // no nodes transmitting. bus is idle
+            self.set_state(BusState::Idle);
+        } else {
+            self.state = BusState::Transmitting;
         }
-
-        // update bus state
-        self.set_state(BusState::Transmitting);
 
         // determine the winning bit
         // the winning bit will always be 0.
         // if there is a 0, winning bit is zero, otherwise its 1
-        let winning_bit = !bits_to_drive_this_tick.iter().any(|b| !(*b));
+        let winning_bit = {
+            if self.state == BusState::Idle {
+                // send recessive 1 (true) when bus is idle
+                true
+            } else {
+                !bits_to_drive_this_tick.iter().any(|b| !(*b))
+            }
+        };
 
-        // iterate through all nodes and transmit winning bit
         for node in self.nodes.iter_mut() {
             if !node.is_active() {
                 continue;
             }
 
             if node.state() == NodeState::Idle {
-                node.set_state(NodeState::Receiving);
+                node.set_receiving();
             }
 
             node.read_wire(winning_bit)?;
