@@ -1,6 +1,7 @@
 use crate::{
     can::CanId,
     node::{Node, NodeState, ProtiumNodeError},
+    printerr, printwarn,
 };
 
 /// Current state of the bus. Determines whether or not
@@ -142,7 +143,34 @@ impl Bus {
                 node.set_receiving();
             }
 
-            node.read_wire(winning_bit)?;
+            node.store_bit(winning_bit);
+            if let Err(e) = node.process_receive() {
+                printwarn!(
+                    "[process_receive] node '{}' encountered a receive error. error: '{}'",
+                    node.id(),
+                    e
+                );
+                node.error(false);
+            }
+
+            if node.state() == NodeState::Transmitting {
+                match node.process_transmit(winning_bit) {
+                    Err(e) => {
+                        printwarn!("[process_transmit] encountered recoverable error when processing transmitted bit. retransmitting. error: '{e}'");
+                        node.state = NodeState::Receiving;
+                        if !node.pending_retransmission() {
+                            node.queue_retransmission(true);
+                        }
+                        node.error(true);
+                    }
+                    _ => {
+                        if node.pending_retransmission() {
+                            node.queue_retransmission(false);
+                        }
+                    }
+                }
+            }
+            // node.read_wire(winning_bit)?;
         }
 
         Ok(())

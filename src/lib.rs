@@ -19,7 +19,7 @@ mod tests {
         const EXPECTED_CHECKSUM_RESULT: u16 = 0x7bf1;
 
         let inp = BitVec::from_vec("hello".as_bytes().to_vec());
-        let calculated_checksum = Frame::checksum_with_input(&inp).unwrap();
+        let calculated_checksum = Frame::checksum_with_input(&inp);
         if calculated_checksum != EXPECTED_CHECKSUM_RESULT {
             Err(format!(
                 "wrong checksum result for frame - expected: `{:#02x}` received: `{:#02x}`",

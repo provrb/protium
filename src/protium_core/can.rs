@@ -484,12 +484,14 @@ impl Frame {
     pub fn checksum(&self) -> Result<u16, ProtiumFrameError> {
         // checksum = input data (as a binary stream) % generator constant
         let input_data = self.create_checksum_input_stream()?;
-        Frame::checksum_with_input(&input_data)
+        Ok(Frame::checksum_with_input(&input_data))
     }
 
     /// Perform the CRC-15 checksum algorithm on the given input data.
     /// Note: the function assumes `input_data` has the correct 15 0-bit padding
-    pub fn checksum_with_input(input_data: &BitVec<u8, Msb0>) -> Result<u16, ProtiumFrameError> {
+    pub fn checksum_with_input(input_data: &BitVec<u8, Msb0>) -> u16 {
+        println!("[checksum_with_input] on {}", input_data);
+
         let mut crc = 0;
         for bit in input_data {
             let feedback = ((crc >> 14) & 1) ^ (*bit as u16);
@@ -502,8 +504,7 @@ impl Frame {
             }
         }
 
-        let checksum = crc;
-        Ok(checksum)
+        crc
     }
 
     /// Converts the abstracted Frame object into a CAN accurate encoded bitstream frame
@@ -581,7 +582,9 @@ impl Frame {
             let mut padded = bitstream.clone();
             push_n_bits(&mut padded, 0, 15);
 
-            let checksum = Self::checksum_with_input(&padded)?;
+            let checksum = Self::checksum_with_input(&padded);
+            println!("while encoded: checksum input data:{}", padded);
+            println!("generated checksum u16 {}", checksum);
 
             push_n_bits(&mut crc_field, checksum as u32, 15); // 1. checksum
         }

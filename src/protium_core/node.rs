@@ -3,7 +3,7 @@ use crate::{
         CanId, Frame, ProtiumFrameError, WireBits, WireLayout, IDENTIFIER_EXTENSION_BIT_IDX,
         MAX_EXTENDED_FRAME_SIZE_BITS,
     },
-    printerr,
+    printerr, printwarn,
 };
 use bitvec::{field::BitField, order::Msb0, vec::BitVec};
 use std::cmp::Ordering;
@@ -14,9 +14,17 @@ pub enum ProtiumNodeError {
     #[error("node transmit stream invalid/unexpected value")]
     InvalidTransmissionStream,
     #[error("no dominant ack slot bit detected after sending recessive ack slot bit")]
-    FrameNotAcknowledged,
+    AckError,
     #[error("node lost transmission due to bus priority")]
     NodeLostTransmission,
+    #[error("attempt to access out of bounds slice in receive stream. is the receive stream aligned as expected?")]
+    OutOfBoundsRxStreamAccess,
+    #[error("recessive bit read on wire after transmitting a dominant bit")]
+    BitError,
+    #[error("fixed-field format contains illegal bits. the field this error occured in was the '{0}' field")]
+    FormError(&'static str),
+    #[error("calculated crc != received crc. the receiver calculated crc is '{0}' while the received crc field is '{1}'")]
+    CRCError(u16, u16),
 }
 
 /// Represents the current Node error state.
@@ -127,7 +135,7 @@ pub struct Node {
     can_id: CanId,
     /// Only process frames from other nodes with the following `CanId`'s
     filtered_can_ids: Vec<CanId>,
-    state: NodeState,
+    pub(crate) state: NodeState,
     error_state: NodeErrorState,
     receive_error_counter: u16,
     transmit_error_counter: u16,
@@ -223,8 +231,10 @@ impl Node {
         }
 
         if let Some(received_bits) = self.receive_stream.as_ref().map(|rs| &rs.bits) {
-            if let Some(received_callback) = self.on_complete_receive_callback.as_ref() {
-                received_callback(self.can_id, received_bits);
+            if !received_bits.is_empty() {
+                if let Some(received_callback) = self.on_complete_receive_callback.as_ref() {
+                    received_callback(self.can_id, received_bits);
+                }
             }
         }
 
@@ -336,64 +346,35 @@ impl Node {
         }
     }
 
-    /// Take a relayed bit `wire` received from a node via a working CAN bus,
-    /// andreceive the bit and transmit a bit only if
-    /// `Node.state` is Transmitting and a frame has had
-    /// transmission prepared with [`crate::node::Node::prepare_transmission`]
-    pub(crate) fn read_wire(&mut self, wire: bool) -> Result<(), ProtiumNodeError> {
-        // if the bus is idle it will send recessive (1/true) bits
-        let rc_stream = &self.receive_stream;
-        if rc_stream.is_none() && wire {
-            return Ok(());
+    pub fn store_bit(&mut self, bit: bool) {
+        let rc_stream = self.receive_stream.get_or_insert(ReceiveStream {
+            bits: WireBits::with_capacity(MAX_EXTENDED_FRAME_SIZE_BITS),
+            rc_idx: 0,
+            pending_ack: false,
+            is_extended_frame: false,
+            frame_dlc_bits: WireBits::with_capacity(4),
+            frame_data_length: None,
+            frame_layout: None,
+        });
+
+        // idle noise from the bus.
+        // when we receive we receive a SOF bit
+        if rc_stream.bits.is_empty() && bit {
+            return;
         }
 
-        Node::receive_bit(
-            self.receive_stream.get_or_insert(ReceiveStream {
-                bits: WireBits::with_capacity(MAX_EXTENDED_FRAME_SIZE_BITS),
-                rc_idx: 0,
-                pending_ack: false,
-                is_extended_frame: false,
-                frame_dlc_bits: WireBits::with_capacity(4),
-                frame_data_length: None,
-                frame_layout: None,
-            }),
-            wire,
-            self.state,
-        );
-
-        if self.state == NodeState::Transmitting {
-            return match Node::transmit_bit(
-                self.transmit_stream
-                    .as_mut()
-                    .ok_or(ProtiumNodeError::InvalidTransmissionStream)?,
-                wire,
-            ) {
-                Err(ProtiumNodeError::NodeLostTransmission) => {
-                    self.state = NodeState::Receiving;
-                    if !self.pending_retransmission() {
-                        self.queue_retransmission(true);
-                    }
-
-                    // self.set_state(NodeState::Receiving);
-                    Ok(())
-                }
-
-                Err(e) => Err(e),
-                _ => {
-                    if self.pending_retransmission() {
-                        self.queue_retransmission(false);
-                    }
-
-                    Ok(())
-                }
-            };
-        }
-
-        Ok(())
+        rc_stream.bits.push(bit);
+        rc_stream.rc_idx += 1;
     }
 
-    fn receive_bit(rc_stream: &mut ReceiveStream, bit: bool, node_state: NodeState) {
-        let rc_idx = rc_stream.rc_idx;
+    pub(crate) fn process_receive(&mut self) -> Result<(), ProtiumNodeError> {
+        let Some(rc_stream) = &mut self.receive_stream else {
+            return Ok(());
+        };
+        let rc_idx = rc_stream.rc_idx.saturating_sub(1);
+        let Some(bit) = rc_stream.bits.last().map(|b| *b) else {
+            return Ok(());
+        };
 
         // goal: check if this is an ack slot to set the bit to 0
         // construct a wire layout based on the bits we receive
@@ -422,7 +403,7 @@ impl Node {
 
         if let Some(layout) = rc_stream.frame_layout {
             if rc_idx + 1 == layout.acknowledgement_field.start
-                && node_state == NodeState::Receiving
+                && self.state == NodeState::Receiving
             {
                 let received_checksum: u16 = match rc_stream
                     .bits
@@ -431,7 +412,7 @@ impl Node {
                     Some(checksum) => checksum.load_be(),
                     None => {
                         printerr!("failed to construct received checksum from bitslice - diagnostic information: \n`layout`: {:#?}", layout);
-                        return;
+                        return Err(ProtiumNodeError::OutOfBoundsRxStreamAccess);
                     }
                 };
 
@@ -439,45 +420,48 @@ impl Node {
                     Some(input) => input.to_bitvec(),
                     None => {
                         printerr!("failed to construct checksum INPUT to calculate checksum from bitslice: `0..layout.data_field.end()` - `layout`: {:#?}", layout);
-                        return;
+                        return Err(ProtiumNodeError::OutOfBoundsRxStreamAccess);
                     }
                 };
 
                 checksum_input.append(&mut BitVec::<u8, Msb0>::repeat(false, 15));
 
-                match Frame::checksum_with_input(&checksum_input) {
-                    Ok(calculated_checksum) => {
-                        rc_stream.pending_ack = calculated_checksum == received_checksum;
-                    }
-                    Err(e) => {
-                        printerr!("call to `Frame::checksum_with_input` calculating checksum with input `{}` failed - error: `{}`", checksum_input, e);
-                        return;
-                    }
+                let calculated_checksum = Frame::checksum_with_input(&checksum_input);
+                if calculated_checksum != received_checksum {
+                    return Err(ProtiumNodeError::CRCError(calculated_checksum, received_checksum));
                 }
+
+                rc_stream.pending_ack = calculated_checksum == received_checksum;
             }
         }
 
-        rc_stream.bits.push(bit);
-        rc_stream.rc_idx += 1;
+        Ok(())
     }
 
-    fn transmit_bit(ts_stream: &mut TransmitStream, wire: bool) -> Result<(), ProtiumNodeError> {
+    pub(crate) fn process_transmit(&mut self, wire: bool) -> Result<(), ProtiumNodeError> {
+        let Some(ts_stream) = &mut self.transmit_stream else {
+            return Ok(());
+        };
         // the current bit idx of what bit to transmit next
         let ts_idx = ts_stream.ts_idx;
         let last_ts_idx = ts_idx.saturating_sub(1);
-
-        let Some(last_sent) = ts_stream.bits.get(last_ts_idx) else {
+        let Some(last_sent) = ts_stream.bits.get(last_ts_idx).map(|b| *b) else {
             return Ok(());
         };
 
         // a bit on the wire has changed and is not the same as the bit we sent
+        // we sent a 0 (dominant bit) but the wire has a 1 (recessive bit) which is very wrong
+        if !last_sent && wire {
+            return Err(ProtiumNodeError::BitError);
+        }
+
         if wire != last_sent {
             // check if we lost transmission to another node
             // we only need to check if we are in CAN IDS, RTR, or IDE
             let arbitration_loss_possible_range_idx =
                 0..ts_stream.ts_frame_layout.arbitration_field.end();
 
-            if arbitration_loss_possible_range_idx.contains(&ts_idx) {
+            if arbitration_loss_possible_range_idx.contains(&last_ts_idx) {
                 return Err(ProtiumNodeError::NodeLostTransmission);
             }
         } else {
@@ -486,15 +470,15 @@ impl Node {
             if last_ts_idx == ts_stream.ts_frame_layout.acknowledgement_field.start {
                 // we send a recessive ack slot bit and it hasn't changed, meaning no node
                 // flipped it to tell us a node received our bits
-                return Err(ProtiumNodeError::FrameNotAcknowledged);
+                return Err(ProtiumNodeError::AckError);
             }
         }
 
         Ok(())
     }
 
-    fn error(&mut self, while_transmitting: bool) {
-        if while_transmitting {
+    pub(crate) fn error(&mut self, transmit_error: bool) {
+        if transmit_error {
             self.transmit_error_counter += 1
         } else {
             self.receive_error_counter += 1
