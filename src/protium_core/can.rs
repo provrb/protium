@@ -14,6 +14,10 @@ const CRC_15_GENERATOR_POLYNOMIAL: u16 = 0b0100010110011001;
 /// The bit index for the IDE  is the same for both 29-bit and 11-bit CAN frames
 pub(crate) const IDENTIFIER_EXTENSION_BIT_IDX: usize = 13;
 
+/// Substitute remote request bit - On an extended frame the bit at index 12
+/// will always be in
+pub(crate) const SRR_BIT_IDX: usize = 12;
+
 /// Minimum valid size of an unstuffed 11-bit CAN ID frame in bits
 /// 44 bits (0 byte data field)
 pub const MIN_STANDARD_FRAME_SIZE_BITS: usize = 44;

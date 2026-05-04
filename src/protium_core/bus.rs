@@ -1,7 +1,7 @@
 use crate::{
     can::CanId,
     node::{Node, NodeState, ProtiumNodeError},
-    printerr, printwarn,
+    printwarn,
 };
 
 /// Current state of the bus. Determines whether or not

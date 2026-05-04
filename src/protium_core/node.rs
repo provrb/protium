@@ -1,30 +1,38 @@
 use crate::{
     can::{
         CanId, Frame, ProtiumFrameError, WireBits, WireLayout, IDENTIFIER_EXTENSION_BIT_IDX,
-        MAX_EXTENDED_FRAME_SIZE_BITS,
+        MAX_EXTENDED_FRAME_SIZE_BITS, SRR_BIT_IDX,
     },
-    printerr, printwarn,
+    printerr,
 };
 use bitvec::{field::BitField, order::Msb0, vec::BitVec};
-use std::cmp::Ordering;
+use std::{cmp::Ordering, ops::Deref};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ProtiumNodeError {
-    #[error("node transmit stream invalid/unexpected value")]
-    InvalidTransmissionStream,
-    #[error("no dominant ack slot bit detected after sending recessive ack slot bit")]
-    AckError,
+    // Implementation errors
     #[error("node lost transmission due to bus priority")]
     NodeLostTransmission,
-    #[error("attempt to access out of bounds slice in receive stream. is the receive stream aligned as expected?")]
-    OutOfBoundsRxStreamAccess,
+    #[error("implementation error in rx/tx bit stream: frame layout/length desync. attempt to access out of bounds index in stream.")]
+    BitStreamOutOfBounds,
+
+    // CAN errors
     #[error("recessive bit read on wire after transmitting a dominant bit")]
     BitError,
     #[error("fixed-field format contains illegal bits. the field this error occured in was the '{0}' field")]
     FormError(&'static str),
     #[error("calculated crc != received crc. the receiver calculated crc is '{0}' while the received crc field is '{1}'")]
     CRCError(u16, u16),
+    #[error("no dominant ack slot bit detected after sending recessive ack slot bit")]
+    AckError,
+}
+
+#[derive(Debug)]
+pub enum TransmitResult {
+    Continue,
+    LostArbitration,
+    Completed,
 }
 
 /// Represents the current Node error state.
@@ -75,7 +83,7 @@ pub enum NodeState {
 }
 
 /// A stream created when receiving a message from the bus
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct ReceiveStream {
     /// The stream of bits received
     bits: WireBits,
@@ -401,7 +409,13 @@ impl Node {
             }
         }
 
+        // a wire layout has been built for the frame. we now
+        // know the start, end and length of all CAN frame fields
+        // and can use this information to our advantange.
         if let Some(layout) = rc_stream.frame_layout {
+            // after we build a frame layout we want to determine
+            // when we need to flip the ack bit to let transmitters know
+            // we received their message
             if rc_idx + 1 == layout.acknowledgement_field.start
                 && self.state == NodeState::Receiving
             {
@@ -412,7 +426,7 @@ impl Node {
                     Some(checksum) => checksum.load_be(),
                     None => {
                         printerr!("failed to construct received checksum from bitslice - diagnostic information: \n`layout`: {:#?}", layout);
-                        return Err(ProtiumNodeError::OutOfBoundsRxStreamAccess);
+                        return Err(ProtiumNodeError::BitStreamOutOfBounds);
                     }
                 };
 
@@ -420,7 +434,7 @@ impl Node {
                     Some(input) => input.to_bitvec(),
                     None => {
                         printerr!("failed to construct checksum INPUT to calculate checksum from bitslice: `0..layout.data_field.end()` - `layout`: {:#?}", layout);
-                        return Err(ProtiumNodeError::OutOfBoundsRxStreamAccess);
+                        return Err(ProtiumNodeError::BitStreamOutOfBounds);
                     }
                 };
 
@@ -428,10 +442,78 @@ impl Node {
 
                 let calculated_checksum = Frame::checksum_with_input(&checksum_input);
                 if calculated_checksum != received_checksum {
-                    return Err(ProtiumNodeError::CRCError(calculated_checksum, received_checksum));
+                    return Err(ProtiumNodeError::CRCError(
+                        calculated_checksum,
+                        received_checksum,
+                    ));
                 }
 
                 rc_stream.pending_ack = calculated_checksum == received_checksum;
+            }
+
+            // verify all forms depending on rc_idx
+            let verify_bit_at_index_is =
+                |bit: bool, idx: usize, form: &'static str| -> Result<(), ProtiumNodeError> {
+                    if rc_stream
+                        .deref()
+                        .bits
+                        .get(idx)
+                        .map(|b| *b)
+                        .ok_or(ProtiumNodeError::BitStreamOutOfBounds)?
+                        != bit
+                    {
+                        Err(ProtiumNodeError::FormError(form))
+                    } else {
+                        Ok(())
+                    }
+                };
+
+            if rc_stream.is_extended_frame {
+                // verify SRR bit is 1
+                if rc_idx >= SRR_BIT_IDX {
+                    verify_bit_at_index_is(true, SRR_BIT_IDX, "SRR bit")?;
+                }
+
+                // verify ctrl field r0 bit is 0
+                if rc_idx >= layout.control_field.start {
+                    verify_bit_at_index_is(false, layout.control_field.start, "Control Field R0")?;
+                }
+            }
+
+            // verify ctrl field r1 bit is dominant
+            if rc_idx > layout.control_field.start {
+                verify_bit_at_index_is(false, layout.control_field.start + 1, "Control Field R1")?;
+            }
+
+            // verify crc delimeter is recessive
+            if rc_idx >= layout.crc_field.end() - 1 {
+                verify_bit_at_index_is(true, layout.crc_field.end() - 1, "CRC Delimeter")?;
+            }
+
+            // verify ack delimeter
+            if rc_idx > layout.acknowledgement_field.start {
+                verify_bit_at_index_is(
+                    true,
+                    layout.acknowledgement_field.start + 1,
+                    "ACK Delimeter",
+                )?;
+            }
+
+            // verify end of frame field is all recessive bits
+            if rc_idx >= layout.end_of_frame_field.end() {
+                let eof_bit_rng = rc_stream.bits.len()..rc_stream.bits.len().saturating_sub(7);
+                if eof_bit_rng.len() != 7 {
+                    return Err(ProtiumNodeError::BitStreamOutOfBounds);
+                }
+
+                if !rc_stream
+                    .bits
+                    .get(eof_bit_rng)
+                    .ok_or(ProtiumNodeError::BitStreamOutOfBounds)?
+                    .all()
+                {
+                    return Err(ProtiumNodeError::FormError("EOF Field"));
+                }
             }
         }
 
@@ -442,6 +524,7 @@ impl Node {
         let Some(ts_stream) = &mut self.transmit_stream else {
             return Ok(());
         };
+        
         // the current bit idx of what bit to transmit next
         let ts_idx = ts_stream.ts_idx;
         let last_ts_idx = ts_idx.saturating_sub(1);
