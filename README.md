@@ -165,6 +165,8 @@ node.set_on_complete_receive_callback(|node_id, bits| {
 - Network/Transport Layer protocols (ISO-TP)
 - Application layer support
 - CAN FD (Flexible Data-rate) support
+- Full ECU simulation
+- Bit stuffing fully integrated into transmitting and receiving logic
 
 ## Architecture
 
@@ -248,7 +250,7 @@ Contributions are welcome! Areas for contribution include:
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [MIT License](LICENSE.md).
 
 ## Support & Documentation
 
