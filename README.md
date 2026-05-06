@@ -1,3 +1,5 @@
+**I will admit, many parts of this README were generated using GitHub Copilot.**
+
 # Protium
 
 A Rust library for simulating CAN (Controller Area Network) bus communication with multi-node support and complete ISO 11898-1 protocol implementation.
