@@ -1,6 +1,11 @@
 use bitvec::prelude::*;
-use std::{fmt::Display, ops::RangeInclusive};
+use std::{
+    fmt::Display,
+    ops::{Range, RangeInclusive},
+};
 use thiserror::Error;
+
+use crate::bit_stuff;
 
 /// The generator polynomial constant used for CRC-15 (used by CAN) checksum
 /// as the divisor to generate a checksum for the provided input data.
@@ -11,7 +16,7 @@ const CRC_15_GENERATOR_POLYNOMIAL: u16 = 0b0100010110011001;
 /// The position/index of the bit in an encoded CAN Frame bitsream that determines
 /// if the CAN Frame is a 29-bit CAN ID frame or 11-bit CAN ID Frame
 ///
-/// The bit index for the IDE  is the same for both 29-bit and 11-bit CAN frames
+/// The bit index for the IDE is the same for both 29-bit and 11-bit CAN frames
 pub(crate) const IDENTIFIER_EXTENSION_BIT_IDX: usize = 13;
 
 /// Substitute remote request bit - On an extended frame the bit at index 12
@@ -23,20 +28,22 @@ pub(crate) const SRR_BIT_IDX: usize = 12;
 pub const MIN_STANDARD_FRAME_SIZE_BITS: usize = 44;
 /// Maximum valid size of an unstuffed 11-bit CAN ID frame in bits
 /// 108 bits (8 byte (max for classical CAN) data field)
-pub const MAX_STANDARD_FRAME_SIZE_BITS: usize = 108;
+pub const MAX_UNSTUFFED_STANDARD_FRAME_SIZE_BITS: usize = 108;
+pub const MAX_STUFFED_STANDARD_FRAME_SIZE_BITS: usize = 130;
 /// Range of the valid size an 11-bit standard unstuffed CAN frame can be in bits.
 pub const VALID_STANDARD_FRAME_SIZE_BITS: RangeInclusive<usize> =
-    MIN_STANDARD_FRAME_SIZE_BITS..=MAX_STANDARD_FRAME_SIZE_BITS;
+    MIN_STANDARD_FRAME_SIZE_BITS..=MAX_UNSTUFFED_STANDARD_FRAME_SIZE_BITS;
 
 /// Minimum valid size of an unstuffed extended 29-bit CAN ID frame in bits
 /// 64 bits (0 byte data field)
 pub const MIN_EXTENDED_FRAME_SIZE_BITS: usize = 64;
 /// Maximum valid size of an unstuffed extended 29-bit CAN ID frame in bits
 /// 128 bits (8 byte (max for classical CAN) data field
-pub const MAX_EXTENDED_FRAME_SIZE_BITS: usize = 128;
+pub const MAX_UNSTUFFED_EXTENDED_FRAME_SIZE_BITS: usize = 128;
+pub const MAX_STUFFED_EXTENDED_FRAME_SIZE_BITS: usize = 153;
 /// Range of the valid size a 29-bit extended unstuffed CAN frame can be in bits.
 pub const VALID_EXTENDED_FRAME_SIZE_BITS: RangeInclusive<usize> =
-    MIN_EXTENDED_FRAME_SIZE_BITS..=MAX_EXTENDED_FRAME_SIZE_BITS;
+    MIN_EXTENDED_FRAME_SIZE_BITS..=MAX_UNSTUFFED_EXTENDED_FRAME_SIZE_BITS;
 
 /// The bits in an 11-bit CAN ID that contain the int that represents the length of the data
 pub(crate) const STANDARD_DLC_BIT_RANGE_IDX: RangeInclusive<usize> = 15..=18;
@@ -66,6 +73,10 @@ pub enum ProtiumFrameError {
     InvalidFrameField { field_bits: BitVec<u8, Msb0> },
     #[error("invalid frame payload size (bytes). got `{invalid_size}` bytes")]
     InvalidPayloadSize { invalid_size: usize },
+    #[error("out of range bitstream access. attempt to access index/range out of bitstream size")]
+    OutOfBoundsAccess,
+    #[error("error parsing field in frame. somewhere in the frame contains a field that is corrupt. (this should be unreachable.)")]
+    CorruptFieldInFrame,
 }
 
 #[repr(u32)]
@@ -193,7 +204,7 @@ pub struct WireLayout {
 
 impl WireLayout {
     pub fn generate_layout(data_size_bits: usize, extended: bool) -> Self {
-        let arbitration_field_size_bits = if extended { 32 } else { 12 };
+        let arbitration_field_size_bits: usize = if extended { 32 } else { 12 };
         let mut layout = WireLayout::default();
         layout.arbitration_field = FieldSpan {
             start: 1,
@@ -334,6 +345,20 @@ impl EncodedFrame {
         }
     }
 
+    pub fn is_remote_request(&self) -> bool {
+        if self.is_extended() {
+            match self.bits.get(32) {
+                Some(rtr_bit) => rtr_bit == true,
+                None => false,
+            }
+        } else {
+            match self.bits.get(12) {
+                Some(rtr_bit) => rtr_bit == true,
+                None => false,
+            }
+        }
+    }
+
     /// Get the length of the data field in bytes
     ///
     /// Read the 4-bit long Data Length Code (DLC) in the CAN frame bits
@@ -455,6 +480,54 @@ impl Frame {
         })
     }
 
+    pub fn from_encoded_bits(bitstream: &WireBits) -> Result<Self, ProtiumFrameError> {
+        let ef = EncodedFrame::new(bitstream.clone())?;
+        let can_id = {
+            const STANDARD_CAN_ID_BIT_IDX: Range<usize> = 1..12;
+            const EXTENDED_CAN_ID_BIT_IDX: Range<usize> = 14..32;
+
+            let bits = ef.wire_bits();
+            if ef.is_extended() {
+                let can_id_11b = bits
+                    .get(STANDARD_CAN_ID_BIT_IDX)
+                    .map(|bs| bs.to_bitvec())
+                    .ok_or(ProtiumFrameError::OutOfBoundsAccess)?;
+
+                let can_id_18b = bits
+                    .get(EXTENDED_CAN_ID_BIT_IDX)
+                    .map(|bs| bs.to_bitvec())
+                    .ok_or(ProtiumFrameError::OutOfBoundsAccess)?;
+
+                let can_id: WireBits = can_id_11b.iter().chain(can_id_18b.iter()).collect();
+                CanId::Extended(can_id.load_be())
+            } else {
+                let can_id = bits
+                    .get(STANDARD_CAN_ID_BIT_IDX)
+                    .map(|bs| bs.to_bitvec())
+                    .ok_or(ProtiumFrameError::OutOfBoundsAccess)?;
+                CanId::Standard(can_id.load_be())
+            }
+        };
+
+        let data_start = ef.bit_layout().data_field.start;
+        let data_end = ef.bit_layout().data_field.end();
+        let data_bits = ef
+            .bits
+            .get(data_start..data_end)
+            .map(|data_bits| {
+                let mut bv = data_bits.to_bitvec();
+                bv.force_align();
+                bv.into_vec()
+            })
+            .ok_or(ProtiumFrameError::CorruptFieldInFrame)?;
+
+        Ok(Frame {
+            can_id,
+            payload: data_bits,
+            is_remote_request: ef.is_remote_request(),
+        })
+    }
+
     pub fn id(&self) -> &CanId {
         &self.can_id
     }
@@ -469,6 +542,10 @@ impl Frame {
 
     pub fn data(&self) -> &Vec<u8> {
         &self.payload
+    }
+
+    pub fn payload_is_printable(&self) -> bool {
+        self.payload.is_ascii()
     }
 
     pub fn is_remote_request(&self) -> bool {
@@ -494,8 +571,6 @@ impl Frame {
     /// Perform the CRC-15 checksum algorithm on the given input data.
     /// Note: the function assumes `input_data` has the correct 15 0-bit padding
     pub fn checksum_with_input(input_data: &BitVec<u8, Msb0>) -> u16 {
-        println!("[checksum_with_input] on {}", input_data);
-
         let mut crc = 0;
         for bit in input_data {
             let feedback = ((crc >> 14) & 1) ^ (*bit as u16);
@@ -514,9 +589,9 @@ impl Frame {
     /// Converts the abstracted Frame object into a CAN accurate encoded bitstream frame
     pub fn encode(&self) -> Result<WireBits, ProtiumFrameError> {
         let capacity = if self.is_extended() {
-            MAX_EXTENDED_FRAME_SIZE_BITS
+            MAX_UNSTUFFED_EXTENDED_FRAME_SIZE_BITS
         } else {
-            MAX_STANDARD_FRAME_SIZE_BITS
+            MAX_UNSTUFFED_STANDARD_FRAME_SIZE_BITS
         };
 
         let mut bitstream = WireBits::with_capacity(capacity);
@@ -587,9 +662,6 @@ impl Frame {
             push_n_bits(&mut padded, 0, 15);
 
             let checksum = Self::checksum_with_input(&padded);
-            println!("while encoded: checksum input data:{}", padded);
-            println!("generated checksum u16 {}", checksum);
-
             push_n_bits(&mut crc_field, checksum as u32, 15); // 1. checksum
         }
 
@@ -610,6 +682,105 @@ impl Frame {
         bitstream.append(&mut eof_field);
 
         Ok(bitstream)
+    }
+
+    pub fn encode_stuffed(&self) -> Result<WireBits, ProtiumFrameError> {
+        let capacity = if self.is_extended() {
+            MAX_STUFFED_EXTENDED_FRAME_SIZE_BITS
+        } else {
+            MAX_STUFFED_STANDARD_FRAME_SIZE_BITS
+        };
+
+        let mut bitstream_to_be_stuffed = WireBits::with_capacity(capacity);
+        bitstream_to_be_stuffed.push(false); // SOF bit
+
+        // Aarbitration Field
+        // For extended frames contains:
+        // 1. 11 Bit CAN ID
+        // 2. Substitute remote request (SRR) bit
+        // 3. Identifier extension (IDE) bit
+        // 4. 18 Bit CAN ID
+        // 5. Remote transmission request (RTR) bit
+        //
+        // For standard frames contains:
+        // 1. 11 Bit CAN ID
+        // 2. Remote transmission request (RTR) bit
+        let mut arbitration_field_bits = WireBits::new();
+        match self.can_id {
+            CanId::Standard(base_11_id) => {
+                push_n_bits(&mut arbitration_field_bits, base_11_id as u32, 11);
+                arbitration_field_bits.push(self.is_remote_request); // Remote transmission request RTR bit
+            }
+            CanId::Extended(_) => {
+                let extended_id_split = self.can_id.split_extended_id()?;
+
+                push_n_bits(
+                    &mut arbitration_field_bits,
+                    extended_id_split.base_11_id as u32,
+                    11,
+                );
+                arbitration_field_bits.push(true); // SRR bit, always 1
+                arbitration_field_bits.push(true); // Idetifier extension bit (IDE), always 1 for ext frame
+                push_n_bits(&mut arbitration_field_bits, extended_id_split.ext_18_id, 18);
+                arbitration_field_bits.push(self.is_remote_request); // Remote transmission request RTR bit
+            }
+        }
+
+        // Control Field
+        //
+        // 1. IDE bit for non-extended frames (which is always 0)
+        //    or r0 bit (which is also always 0) for extended frames
+        // 2. r1 bit (always 0)
+        // 3. Data length code (DLC), 4 bits long. Tells the size of the payload in bytes.
+        let mut control_field_bits = WireBits::with_capacity(6);
+        control_field_bits.push(false); // 1. IDE/r0 bit (always 0)
+        control_field_bits.push(false); // 2. r1 bit (always 0)
+        push_n_bits(&mut control_field_bits, self.data_length_bytes() as u32, 4); // 3. DLC
+
+        // Data Field
+        // Push all bytes of data into the bitstream as bits
+        let mut data_field_bits = WireBits::new();
+        for byte in self.data() {
+            push_byte(&mut data_field_bits, *byte);
+        }
+
+        bitstream_to_be_stuffed.append(&mut arbitration_field_bits);
+        bitstream_to_be_stuffed.append(&mut control_field_bits);
+        bitstream_to_be_stuffed.append(&mut data_field_bits);
+
+        // CRC Field
+        // Contains:
+        // 1. 15 bit long CRC-15 CAN checksum
+        // 2. CRC delimeter bit (always 1)
+        let mut crc_field = WireBits::with_capacity(16);
+
+        {
+            let mut padded = bitstream_to_be_stuffed.clone();
+            push_n_bits(&mut padded, 0, 15);
+
+            let checksum = Self::checksum_with_input(&padded);
+
+            push_n_bits(&mut crc_field, checksum as u32, 15); // 1. checksum
+        }
+
+        bitstream_to_be_stuffed.append(&mut crc_field);
+        let mut bitstream_with_stuffed_bits = bit_stuff(&bitstream_to_be_stuffed);
+        bitstream_with_stuffed_bits.push(true); // 2. CRC delimeter - comes after checksum bits
+
+        // Acknowledgement (ACK) Field
+        // Contains:
+        // 1. ACK slot bit. Transmitters set this bit to 1 and
+        //    receivers set this bit to 0.
+        // 2. ACK delimeter
+        let mut ack_field = bitvec![u8, Msb0; 1, 1];
+
+        // End of Frame (EOF) field.
+        // Contains 7 recessive bits at the end of the frame
+        let mut eof_field = bitvec![u8, Msb0; 1,1,1,1,1,1,1];
+        bitstream_with_stuffed_bits.append(&mut ack_field);
+        bitstream_with_stuffed_bits.append(&mut eof_field);
+
+        Ok(bitstream_with_stuffed_bits)
     }
 
     /// Create a binary stream of input data for the checksum to compute with.

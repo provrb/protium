@@ -1,7 +1,7 @@
 use crate::{
     can::{
         CanId, Frame, ProtiumFrameError, WireBits, WireLayout, IDENTIFIER_EXTENSION_BIT_IDX,
-        MAX_EXTENDED_FRAME_SIZE_BITS, SRR_BIT_IDX,
+        MAX_STUFFED_EXTENDED_FRAME_SIZE_BITS, MAX_UNSTUFFED_EXTENDED_FRAME_SIZE_BITS, SRR_BIT_IDX,
     },
     printerr,
 };
@@ -85,10 +85,17 @@ pub enum NodeState {
 /// A stream created when receiving a message from the bus
 #[derive(Debug, Default, Clone)]
 struct ReceiveStream {
-    /// The stream of bits received
-    bits: WireBits,
-    /// The index of the most recent bit received
-    rc_idx: usize,
+    /// The stream of bits received. After every 5 identical consecutive bits, an opposite bit is inserted after.
+    stuffed_bits: WireBits,
+    /// Bits that are not stuffed. This stream can contain more than 5 identical consecutive bits.
+    destuffed_bits: WireBits,
+    /// Tracks the `stuffed_bits` bitstream. Contains the latest bit idx received in `stuffed_bits`
+    wire_idx: usize,
+    /// Tracks the `destuffed_bits` bitstream. Contains the latest bit idx received in `destuffed_bits`
+    frame_idx: usize,
+    /// Tracks the `stuffed_bits` bitstream to detect when a bit is a stuff-bit. Essential in the rolling
+    /// destuffing logic.
+    consecutive_identical_bits: usize,
     /// A flag set if the receiver wants to flip the ACK slot bit in a message.
     /// This is required per-protocol. When a receiver successfully receives a mesasge,
     /// there are no errors (e.g. calculated checksum doesn't equal received checksum),
@@ -130,6 +137,7 @@ struct ReceiveStream {
 struct TransmitStream {
     bits: WireBits,
     ts_idx: usize,
+    ack_slot_stuffed_idx: usize,
     ts_frame_layout: WireLayout,
     pending_retransmit: bool,
 }
@@ -238,7 +246,7 @@ impl Node {
             }
         }
 
-        if let Some(received_bits) = self.receive_stream.as_ref().map(|rs| &rs.bits) {
+        if let Some(received_bits) = self.receive_stream.as_ref().map(|rs| &rs.destuffed_bits) {
             if !received_bits.is_empty() {
                 if let Some(received_callback) = self.on_complete_receive_callback.as_ref() {
                     received_callback(self.can_id, received_bits);
@@ -251,7 +259,7 @@ impl Node {
 
     pub(crate) fn set_transmitting(&mut self) {
         if self.state == NodeState::Receiving {
-            if let Some(received_bits) = self.receive_stream.as_ref().map(|rs| &rs.bits) {
+            if let Some(received_bits) = self.receive_stream.as_ref().map(|rs| &rs.stuffed_bits) {
                 if let Some(received_callback) = self.on_complete_receive_callback.as_ref() {
                     received_callback(self.can_id, received_bits);
                 }
@@ -276,17 +284,54 @@ impl Node {
     /// the encoded frame bits, bit by bit on every bus bit tick unless the node lost tranmission
     /// due to priority.
     pub fn queue_transmission(&mut self, frame: &Frame) -> Result<(), ProtiumFrameError> {
+        let stuffed = frame.encode_stuffed().inspect_err(|_| {
+            self.error(true);
+        })?;
+
         let encoded = frame.encode().inspect_err(|_| {
             self.error(true);
         })?;
 
+        let unstuffed_layout =
+            WireLayout::generate_layout(frame.data_length_bits(), frame.is_extended());
+        let ack_unstuffed = unstuffed_layout.acknowledgement_field.start;
+
+        // Walk stuffed bits, skip stuff bits, count until we've seen ack_unstuffed real bits
+        let mut real_count = 0;
+        let mut consecutive = 0usize;
+        let mut prev: Option<bool> = None;
+        let mut ack_stuffed_idx = 0;
+
+        for (i, bit) in stuffed.iter().enumerate() {
+            let b = *bit;
+            if let Some(p) = prev {
+                if b != p {
+                    if consecutive == 5 {
+                        // this was a stuff bit, don't count it
+                        consecutive = 0;
+                        prev = Some(b);
+                        continue;
+                    }
+                    consecutive = 1;
+                } else {
+                    consecutive += 1;
+                }
+            } else {
+                consecutive = 1;
+            }
+            prev = Some(b);
+            real_count += 1;
+            if real_count == ack_unstuffed + 1 {
+                ack_stuffed_idx = i;
+                break;
+            }
+        }
+
         self.transmit_stream = Some(TransmitStream {
-            bits: encoded,
+            bits: stuffed,
             ts_idx: 0,
-            ts_frame_layout: WireLayout::generate_layout(
-                frame.data_length_bits(),
-                frame.is_extended(),
-            ),
+            ack_slot_stuffed_idx: ack_stuffed_idx,
+            ts_frame_layout: unstuffed_layout,
             pending_retransmit: false,
         });
 
@@ -356,8 +401,11 @@ impl Node {
 
     pub fn store_bit(&mut self, bit: bool) {
         let rc_stream = self.receive_stream.get_or_insert(ReceiveStream {
-            bits: WireBits::with_capacity(MAX_EXTENDED_FRAME_SIZE_BITS),
-            rc_idx: 0,
+            stuffed_bits: WireBits::with_capacity(MAX_STUFFED_EXTENDED_FRAME_SIZE_BITS),
+            destuffed_bits: WireBits::with_capacity(MAX_UNSTUFFED_EXTENDED_FRAME_SIZE_BITS),
+            wire_idx: 0,
+            frame_idx: 0,
+            consecutive_identical_bits: 0,
             pending_ack: false,
             is_extended_frame: false,
             frame_dlc_bits: WireBits::with_capacity(4),
@@ -365,22 +413,34 @@ impl Node {
             frame_layout: None,
         });
 
-        // idle noise from the bus.
-        // when we receive we receive a SOF bit
-        if rc_stream.bits.is_empty() && bit {
+        if rc_stream.stuffed_bits.is_empty() && bit {
             return;
         }
 
-        rc_stream.bits.push(bit);
-        rc_stream.rc_idx += 1;
+        let prev_bit = rc_stream.stuffed_bits.last().map(|b| *b);
+        rc_stream.stuffed_bits.push(bit);
+        rc_stream.wire_idx += 1;
+
+        if Some(bit) == prev_bit {
+            rc_stream.consecutive_identical_bits += 1;
+        } else {
+            if rc_stream.consecutive_identical_bits == 5 {
+                rc_stream.consecutive_identical_bits = 0;
+                return;
+            }
+            rc_stream.consecutive_identical_bits = 1;
+        }
+
+        rc_stream.destuffed_bits.push(bit);
+        rc_stream.frame_idx += 1;
     }
 
     pub(crate) fn process_receive(&mut self) -> Result<(), ProtiumNodeError> {
         let Some(rc_stream) = &mut self.receive_stream else {
             return Ok(());
         };
-        let rc_idx = rc_stream.rc_idx.saturating_sub(1);
-        let Some(bit) = rc_stream.bits.last().map(|b| *b) else {
+        let rc_idx = rc_stream.frame_idx.saturating_sub(1);
+        let Some(bit) = rc_stream.destuffed_bits.last().map(|b| *b) else {
             return Ok(());
         };
 
@@ -420,7 +480,7 @@ impl Node {
                 && self.state == NodeState::Receiving
             {
                 let received_checksum: u16 = match rc_stream
-                    .bits
+                    .destuffed_bits
                     .get(layout.data_field.end()..layout.crc_field.end() - 1)
                 {
                     Some(checksum) => checksum.load_be(),
@@ -430,7 +490,10 @@ impl Node {
                     }
                 };
 
-                let mut checksum_input = match rc_stream.bits.get(0..layout.data_field.end()) {
+                let mut checksum_input = match rc_stream
+                    .destuffed_bits
+                    .get(0..layout.data_field.end())
+                {
                     Some(input) => input.to_bitvec(),
                     None => {
                         printerr!("failed to construct checksum INPUT to calculate checksum from bitslice: `0..layout.data_field.end()` - `layout`: {:#?}", layout);
@@ -456,7 +519,7 @@ impl Node {
                 |bit: bool, idx: usize, form: &'static str| -> Result<(), ProtiumNodeError> {
                     if rc_stream
                         .deref()
-                        .bits
+                        .destuffed_bits
                         .get(idx)
                         .map(|b| *b)
                         .ok_or(ProtiumNodeError::BitStreamOutOfBounds)?
@@ -501,13 +564,13 @@ impl Node {
 
             // verify end of frame field is all recessive bits
             if rc_idx >= layout.end_of_frame_field.end() {
-                let eof_bit_rng = rc_stream.bits.len()..rc_stream.bits.len().saturating_sub(7);
+                let eof_bit_rng = layout.end_of_frame_field.start..layout.end_of_frame_field.end();
                 if eof_bit_rng.len() != 7 {
                     return Err(ProtiumNodeError::BitStreamOutOfBounds);
                 }
 
                 if !rc_stream
-                    .bits
+                    .stuffed_bits
                     .get(eof_bit_rng)
                     .ok_or(ProtiumNodeError::BitStreamOutOfBounds)?
                     .all()
@@ -524,7 +587,7 @@ impl Node {
         let Some(ts_stream) = &mut self.transmit_stream else {
             return Ok(());
         };
-        
+
         // the current bit idx of what bit to transmit next
         let ts_idx = ts_stream.ts_idx;
         let last_ts_idx = ts_idx.saturating_sub(1);
@@ -550,9 +613,7 @@ impl Node {
         } else {
             // a bit on the wire has not changed. this is acceptable only if
             // we didn't just send the ack slot which is supposed to be flipped by a receiver
-            if last_ts_idx == ts_stream.ts_frame_layout.acknowledgement_field.start {
-                // we send a recessive ack slot bit and it hasn't changed, meaning no node
-                // flipped it to tell us a node received our bits
+            if last_ts_idx == ts_stream.ack_slot_stuffed_idx {
                 return Err(ProtiumNodeError::AckError);
             }
         }
