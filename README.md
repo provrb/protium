@@ -153,7 +153,7 @@ node.set_on_complete_receive_callback(|node_id, bits| {
 
 ### Current Implementation
 
-- ✅ **Physical Layer**: Bit-level bus operations, though bit stuffing/destuffing not fully included in tranmitting and receiving process
+- ✅ **Physical Layer**: Bit-level bus operations
 - ✅ **Data Link Layer**: Frame encoding/decoding, CRC-15 checksums, arbitration
 - ✅ **Standard CAN Frames**: 11-bit CAN IDs with up to 8 bytes payload
 - ✅ **Extended CAN Frames**: 29-bit CAN IDs with up to 8 bytes payload
@@ -161,12 +161,11 @@ node.set_on_complete_receive_callback(|node_id, bits| {
 - ✅ **CAN Arbitration**: Automatic priority resolution during collisions
 
 ### Planned Features
-
-- Network/Transport Layer protocols (ISO-TP)
-- Application layer support
-- CAN FD (Flexible Data-rate) support
-- Full ECU simulation
-- Bit stuffing fully integrated into transmitting and receiving logic
+1. ✅ ~~Bit stuffing fully integrated into transmitting and receiving logic~~
+2. Network/Transport Layer protocols (ISO-TP)
+3. Application layer support
+4. Full ECU simulation
+5. CAN FD (Flexible Data-rate) support
 
 ## Architecture
 
