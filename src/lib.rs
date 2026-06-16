@@ -13,6 +13,14 @@ mod tests {
     use super::protium_core::can::*;
     use bitvec::{bitvec, order::Msb0, vec::BitVec};
 
+    fn expected_bits(can_id: CanId, payload: Vec<u8>) -> BitVec<u8, Msb0> {
+        let frame = Frame::new(can_id, payload, false).unwrap();
+        let mut bits = frame.encode().unwrap();
+        let layout = WireLayout::generate_layout(frame.data_length_bits(), frame.is_extended());
+        bits.set(layout.acknowledgement_field.start, false);
+        bits
+    }
+
     // CRC-15 CAN checksum computation test
     #[test]
     fn checksum() -> Result<(), String> {
@@ -257,5 +265,185 @@ mod tests {
             bit_destuff(&bitvec![u8, Msb0; 1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0]),
             bitvec![u32, Msb0; 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
         );
+    }
+
+    #[test]
+    fn nodes_send_and_receive_extended() {
+        let mut bus = Bus::new(10);
+
+        let ecm_id = CanId::Standard(0x7E8);
+        let tcm_id = CanId::Extended(0x0CF00500);
+
+        let mut ecm = Node::new(ecm_id);
+        let mut tcm = Node::new(tcm_id);
+
+        let frame =
+            Frame::new(tcm.id(), vec![0x22], false).expect("failed to create extended frame");
+
+        tcm.queue_transmission(&frame)
+            .expect("failed to queue extended frame transmission");
+
+        ecm.set_on_complete_receive_callback(|_, bits| {
+            let expected = expected_bits(CanId::Extended(0x0CF00500), vec![0x22]);
+            assert_eq!(
+                bits.len(),
+                expected.len(),
+                "ecm received wrong number of bits from extended frame"
+            );
+            assert_eq!(
+                *bits, expected,
+                "ecm received bits do not match expected extended frame"
+            );
+        });
+
+        tcm.set_on_complete_receive_callback(|_, bits| {
+            let expected = expected_bits(CanId::Extended(0x0CF00500), vec![0x22]);
+            assert_eq!(
+                bits.len(),
+                expected.len(),
+                "tcm received wrong number of bits from extended frame"
+            );
+            assert_eq!(
+                *bits, expected,
+                "tcm received bits do not match expected extended frame"
+            );
+        });
+
+        bus.register_node(ecm);
+        bus.register_node(tcm);
+
+        loop {
+            bus.tick().unwrap();
+            if !bus.is_active() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn nodes_send_and_receive_extended_max_payload() {
+        let mut bus = Bus::new(10);
+
+        let ecm_id = CanId::Standard(0x7E8);
+        let tcm_id = CanId::Extended(0x0CF00500);
+
+        let mut ecm = Node::new(ecm_id);
+        let mut tcm = Node::new(tcm_id);
+
+        let payload = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+        let frame = Frame::new(tcm.id(), payload.clone(), false)
+            .expect("failed to create extended frame with max payload");
+
+        tcm.queue_transmission(&frame)
+            .expect("failed to queue extended frame transmission");
+
+        ecm.set_on_complete_receive_callback(|_, bits| {
+            let expected = expected_bits(
+                CanId::Extended(0x0CF00500),
+                vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04],
+            );
+
+            assert_eq!(
+                bits.len(),
+                expected.len(),
+                "received wrong bit count for max payload extended frame"
+            );
+            assert_eq!(
+                *bits, expected,
+                "received bits do not match expected max payload extended frame"
+            );
+        });
+
+        bus.register_node(ecm);
+        bus.register_node(tcm);
+
+        loop {
+            bus.tick().unwrap();
+            if !bus.is_active() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn nodes_send_and_receive_extended_empty_payload() {
+        let mut bus = Bus::new(10);
+
+        let ecm_id = CanId::Standard(0x7E8);
+        let tcm_id = CanId::Extended(0x0CF00500);
+
+        let mut ecm = Node::new(ecm_id);
+        let mut tcm = Node::new(tcm_id);
+
+        let frame = Frame::new(tcm.id(), vec![], false)
+            .expect("failed to create extended frame with empty payload");
+
+        tcm.queue_transmission(&frame)
+            .expect("failed to queue extended frame transmission");
+
+        ecm.set_on_complete_receive_callback(|_, bits| {
+            let expected = expected_bits(CanId::Extended(0x0CF00500), vec![]);
+
+            assert_eq!(
+                bits.len(),
+                expected.len(),
+                "received wrong bit count for empty payload extended frame"
+            );
+            assert_eq!(
+                *bits, expected,
+                "received bits do not match expected empty payload extended frame"
+            );
+        });
+
+        bus.register_node(ecm);
+        bus.register_node(tcm);
+
+        loop {
+            bus.tick().unwrap();
+            if !bus.is_active() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn nodes_priority_transmission_extended_vs_standard() {
+        let mut bus = Bus::new(10);
+
+        // Standard 0x7E8 = 0b11111101000 — lots of recessive bits, lower priority
+        // Extended 0x0CF00500 starts with 0b00001100 — more dominant bits, higher priority
+        let ecm_id = CanId::Standard(0x7E8);
+        let tcm_id = CanId::Extended(0x0CF00500);
+
+        let mut ecm = Node::new(ecm_id);
+        let mut tcm = Node::new(tcm_id);
+
+        let ecm_frame = Frame::new(ecm.id(), vec![0x22], false).unwrap();
+        let tcm_frame = Frame::new(tcm.id(), vec![0x22], false).unwrap();
+
+        ecm.queue_transmission(&ecm_frame).unwrap();
+        tcm.queue_transmission(&tcm_frame).unwrap();
+
+        bus.register_node(ecm);
+        bus.register_node(tcm);
+
+        let mut ecm_queued_retransmit = false;
+        loop {
+            bus.tick().unwrap();
+
+            if bus.get_node(ecm_id).unwrap().pending_retransmission() {
+                ecm_queued_retransmit = true;
+                break;
+            }
+
+            if !bus.is_active() {
+                break;
+            }
+        }
+
+        assert!(
+        ecm_queued_retransmit,
+        "ecm (standard) should have lost arbitration to tcm (extended) but did not queue retransmission"
+    );
     }
 }
