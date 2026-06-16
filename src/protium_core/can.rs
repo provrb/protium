@@ -7,18 +7,11 @@ use thiserror::Error;
 
 use crate::bit_stuff;
 
-/// The generator polynomial constant used for CRC-15 (used by CAN) checksum
-/// as the divisor to generate a checksum for the provided input data.
-///
-/// All checksum logic must use this in their checksum process.
-const CRC_15_GENERATOR_POLYNOMIAL: u16 = 0b0100010110011001;
-
 /// The position/index of the bit in an encoded CAN Frame bitsream that determines
 /// if the CAN Frame is a 29-bit CAN ID frame or 11-bit CAN ID Frame
 ///
 /// The bit index for the IDE is the same for both 29-bit and 11-bit CAN frames
 pub(crate) const IDENTIFIER_EXTENSION_BIT_IDX: usize = 13;
-
 /// Substitute remote request bit - On an extended frame the bit at index 12
 /// will always be in
 pub(crate) const SRR_BIT_IDX: usize = 12;
@@ -45,13 +38,14 @@ pub const MAX_STUFFED_EXTENDED_FRAME_SIZE_BITS: usize = 153;
 pub const VALID_EXTENDED_FRAME_SIZE_BITS: RangeInclusive<usize> =
     MIN_EXTENDED_FRAME_SIZE_BITS..=MAX_UNSTUFFED_EXTENDED_FRAME_SIZE_BITS;
 
-/// The bits in an 11-bit CAN ID that contain the int that represents the length of the data
-pub(crate) const STANDARD_DLC_BIT_RANGE_IDX: RangeInclusive<usize> = 15..=18;
-/// The bits in a 29-bit CAN ID that contain the int that represents the length of the data
-pub(crate) const EXTENDED_DLC_BIT_RANGE_IDX: RangeInclusive<usize> = 35..=38;
-
 /// For Protium, CAN payloads are limited to 8 bytes
 pub const MAX_CAN_PAYLOAD_BYTES: usize = 8;
+
+// Two signal wires
+/// CAN HIGH represents a dominant bit (0) on the wire
+pub const CAN_H: bool = false;
+/// CAN LOW represents a recessive bit (1) on the wire
+pub const CAN_L: bool = true;
 
 /// An API error, solely for the Protium API: not related to any ISO/protocol/technical errors.
 ///
@@ -364,6 +358,11 @@ impl EncodedFrame {
     /// Read the 4-bit long Data Length Code (DLC) in the CAN frame bits
     /// and convert it to a usize to get the length of the data in bytes.
     pub fn data_length_bytes(&self) -> usize {
+        /// The bits in an 11-bit CAN ID that contain the int that represents the length of the data
+        const STANDARD_DLC_BIT_RANGE_IDX: RangeInclusive<usize> = 15..=18;
+        /// The bits in a 29-bit CAN ID that contain the int that represents the length of the data
+        const EXTENDED_DLC_BIT_RANGE_IDX: RangeInclusive<usize> = 35..=38;
+
         let dlc_bit_range = if self.is_extended() {
             EXTENDED_DLC_BIT_RANGE_IDX
         } else {
@@ -571,6 +570,10 @@ impl Frame {
     /// Perform the CRC-15 checksum algorithm on the given input data.
     /// Note: the function assumes `input_data` has the correct 15 0-bit padding
     pub fn checksum_with_input(input_data: &BitVec<u8, Msb0>) -> u16 {
+        /// The generator polynomial constant used for CRC-15 (used by CAN) checksum
+        /// as the divisor to generate a checksum for the provided input data.
+        const CRC_15_GENERATOR_POLYNOMIAL: u16 = 0b0100010110011001;
+
         let mut crc = 0;
         for bit in input_data {
             let feedback = ((crc >> 14) & 1) ^ (*bit as u16);

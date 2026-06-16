@@ -16,12 +16,8 @@ fn main() {
     let mut ecm = Node::new(CanId::Standard(0x7e8));
     let mut tcm = Node::new(CanId::Extended(0x0CF00500));
 
-    // ECM will send this example data
-    let ecm_frame =
-        Frame::new(ecm.id(), vec![0x22], false).expect("failed to create example ecm frame");
-
     // Set the ECM node is an a transmitting state telling it what to send
-    ecm.queue_transmission(&ecm_frame)
+    ecm.queue_transmission(vec![0x22], false)
         .expect("failed to prepare transmission frame for ECM");
 
     // Example of using a node's received callback function

@@ -1,5 +1,5 @@
 use crate::{
-    can::CanId,
+    can::{CAN_H, CAN_L, CanId},
     node::{Node, NodeState, ProtiumNodeError},
     printwarn,
 };
@@ -21,7 +21,8 @@ pub struct Bus {
     state: BusState,
 
     #[allow(dead_code)]
-    baud_rate: u16, // kbits/s
+    /// RESERVED
+    baud_rate: u16, 
 }
 
 impl Bus {
@@ -30,7 +31,7 @@ impl Bus {
         Self {
             nodes: Vec::new(),
             state: BusState::Idle,
-            baud_rate,
+            baud_rate, // RESERVED
         }
     }
 
@@ -65,6 +66,13 @@ impl Bus {
         &self.nodes
     }
 
+    pub(crate) fn set_state(&mut self, state: BusState) {
+        if self.state == state {
+            return;
+        }
+        self.state = state;
+    }
+
     /// Simulate a bit-tick for the bus.
     ///
     /// 1. Get a vector of all bits every registered node wants to send to the wire.
@@ -78,7 +86,6 @@ impl Bus {
     ///
     /// See:
     ///     - [`crate::node::Node::is_active`]
-    ///     - [`crate::node::Node::read_wire`]
     ///     - [`crate::bus::BusState`]
     ///     - [`crate::node::NodeState`]
     pub fn tick(&mut self) -> Result<(), ProtiumNodeError> {
@@ -128,9 +135,9 @@ impl Bus {
         let winning_bit = {
             if self.state == BusState::Idle {
                 // send recessive 1 (true) when bus is idle
-                true
+                CAN_L
             } else {
-                !bits_to_drive_this_tick.iter().any(|b| !(*b))
+                !bits_to_drive_this_tick.iter().any(|b| *b == CAN_H)
             }
         };
 
@@ -154,32 +161,21 @@ impl Bus {
             }
 
             if node.state() == NodeState::Transmitting {
-                match node.process_transmit(winning_bit) {
-                    Err(e) => {
-                        printwarn!("[process_transmit] encountered recoverable error when processing transmitted bit. retransmitting. error: '{e}'");
-                        node.state = NodeState::Receiving;
-                        if !node.pending_retransmission() {
-                            node.queue_retransmission(true);
-                        }
-                        node.error(true);
+                if let Err(e) = node.process_transmit(winning_bit) {
+                    printwarn!("[process_transmit] encountered recoverable error when processing transmitted bit. retransmitting. error: '{e}'");
+                    node.state = NodeState::Receiving;
+                    if !node.pending_retransmission() {
+                        node.queue_retransmission(true);
                     }
-                    _ => {
-                        if node.pending_retransmission() {
-                            node.queue_retransmission(false);
-                        }
+                    node.error(true);                    
+                } else {
+                    if node.pending_retransmission() {
+                        node.queue_retransmission(false);
                     }
                 }
             }
-            // node.read_wire(winning_bit)?;
         }
 
         Ok(())
-    }
-
-    pub(crate) fn set_state(&mut self, state: BusState) {
-        if self.state == state {
-            return;
-        }
-        self.state = state;
     }
 }

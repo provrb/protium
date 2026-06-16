@@ -112,11 +112,8 @@ mod tests {
         let mut tcm = Node::new(tcm_id);
 
         let engine_oil_temperature = vec![0x22];
-        let engine_oil_frame = Frame::new(ecm.id(), engine_oil_temperature, false)
-            .expect("failed to create example engine oil frame");
-
         // prepare nodes to transmit their data when the bus is active
-        ecm.queue_transmission(&engine_oil_frame)
+        ecm.queue_transmission(engine_oil_temperature, false)
             .expect("failed to prepare transmission frame for ECM");
         ecm.set_on_complete_receive_callback(|can_id, bits| {
             let engine_oil_temperature = vec![0x22];
@@ -163,19 +160,13 @@ mod tests {
         let mut ecm = Node::new(ecm_id);
         let mut tcm = Node::new(tcm_id);
 
-        // frames
-        let ecm_frame =
-            Frame::new(ecm.id(), vec![0x22], false).expect("failed to create example ecm frame");
-        let tcm_frame =
-            Frame::new(tcm_id, vec![0x82], false).expect("failed to create example tcm frame");
-
         // queue both nodes for transmission
         // because ecm has the more amount of dominant bits in its CAN id (0x7E8 | 0b11111101000)
         // it should be the node transmitting the data.
         // then tcm should queue the lost frame for retransmission.
-        ecm.queue_transmission(&ecm_frame)
+        ecm.queue_transmission(vec![0x22], false)
             .expect("failed to prepare transmission frame for ECM");
-        tcm.queue_transmission(&tcm_frame)
+        tcm.queue_transmission(vec![0x82], false)
             .expect("failed to prepare transmission frame for TCM");
 
         // register nodes on bus to send/receive
@@ -277,10 +268,7 @@ mod tests {
         let mut ecm = Node::new(ecm_id);
         let mut tcm = Node::new(tcm_id);
 
-        let frame =
-            Frame::new(tcm.id(), vec![0x22], false).expect("failed to create extended frame");
-
-        tcm.queue_transmission(&frame)
+        tcm.queue_transmission(vec![0x22], false)
             .expect("failed to queue extended frame transmission");
 
         ecm.set_on_complete_receive_callback(|_, bits| {
@@ -330,11 +318,7 @@ mod tests {
         let mut ecm = Node::new(ecm_id);
         let mut tcm = Node::new(tcm_id);
 
-        let payload = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
-        let frame = Frame::new(tcm.id(), payload.clone(), false)
-            .expect("failed to create extended frame with max payload");
-
-        tcm.queue_transmission(&frame)
+        tcm.queue_transmission(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04], false)
             .expect("failed to queue extended frame transmission");
 
         ecm.set_on_complete_receive_callback(|_, bits| {
@@ -375,10 +359,7 @@ mod tests {
         let mut ecm = Node::new(ecm_id);
         let mut tcm = Node::new(tcm_id);
 
-        let frame = Frame::new(tcm.id(), vec![], false)
-            .expect("failed to create extended frame with empty payload");
-
-        tcm.queue_transmission(&frame)
+        tcm.queue_transmission(vec![], false)
             .expect("failed to queue extended frame transmission");
 
         ecm.set_on_complete_receive_callback(|_, bits| {
@@ -418,11 +399,8 @@ mod tests {
         let mut ecm = Node::new(ecm_id);
         let mut tcm = Node::new(tcm_id);
 
-        let ecm_frame = Frame::new(ecm.id(), vec![0x22], false).unwrap();
-        let tcm_frame = Frame::new(tcm.id(), vec![0x22], false).unwrap();
-
-        ecm.queue_transmission(&ecm_frame).unwrap();
-        tcm.queue_transmission(&tcm_frame).unwrap();
+        ecm.queue_transmission(vec![0x22], false).unwrap();
+        tcm.queue_transmission(vec![0x22], false).unwrap();
 
         bus.register_node(ecm);
         bus.register_node(tcm);

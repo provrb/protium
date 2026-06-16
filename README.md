@@ -57,15 +57,8 @@ fn main() {
     let mut ecm = Node::new(CanId::Standard(0x7E8));  // Engine Control Module
     let mut tcm = Node::new(CanId::Standard(0x7EA));  // Transmission Control Module
 
-    // Create a frame with data
-    let frame = Frame::new(
-        ecm.id(),
-        vec![0x22],  // 1 byte of data
-        false,       // not a remote frame
-    ).expect("Failed to create frame");
-
-    // Queue the frame for transmission
-    ecm.queue_transmission(&frame)
+    // Queue the payload `0x22` for transmission - and it isn't a remote request
+    ecm.queue_transmission(vec![0x22], false)
         .expect("Failed to queue transmission");
 
     // Set up a callback to handle received frames on TCM
@@ -209,7 +202,7 @@ pub fn get_nodes(&self) -> &[Node]
 ```rust
 pub fn new(id: CanId) -> Self
 pub fn id(&self) -> CanId
-pub fn queue_transmission(&mut self, frame: &Frame) -> Result<()>
+pub fn queue_transmission(&mut self, payload: Vec<u8>, remote_request: bool) -> Result<()>
 pub fn set_on_complete_tranmission_callback(&mut self, f: impl Fn(CanId))
 pub fn set_on_complete_receive_callback(&mut self, f: impl Fn(CanId, BitVec<u8, Msb0>))
 pub fn state(&self) -> NodeState

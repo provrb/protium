@@ -189,7 +189,7 @@ impl Node {
     /// Check if the current node is active and can
     /// transmit or receive message.
     ///
-    /// An node is inactive if it is in the `BusOff`` `ErrorState` or
+    /// An node is inactive if it is in the `BusOff` `ErrorState` or
     /// the node is in the `Sleeping` state
     pub fn is_active(&self) -> bool {
         if self.state() == NodeState::Error && self.error_state() == NodeErrorState::BusOff
@@ -276,19 +276,27 @@ impl Node {
         self.state = NodeState::Receiving;
     }
 
-    /// Encode and prepare the transmission of `frame` via CAN bus to allow the node
-    /// to be queried by the bus when checking for transmitting nodes.
+    /// Encode and prepare the transmission of a CAN frame containing `payload` that will be
+    /// transmitted via CAN bus
     ///
+    /// ## Naming
+    /// It is named "queue_transmission" and not just "transmit" because the data will
+    /// be sent to all nodes bit-by-bit on a CAN bus during the next CAN bus tick's. The data will be
+    /// transmitted to this node and any other nodes only on the CAN bus they are all similarly
+    /// registered to.
+    ///
+    /// ## What happens when "preparing" a frame for transmission
     /// When a frame is prepared for transmission, `Node.state` will be `Transmitting` and available
-    /// to be queried by the bus when the bus asks this node what bit to drive. The node will push
-    /// the encoded frame bits, bit by bit on every bus bit tick unless the node lost tranmission
-    /// due to priority.
-    pub fn queue_transmission(&mut self, frame: &Frame) -> Result<(), ProtiumFrameError> {
+    /// to be queried by the bus. When the bus detects the node wants to transmit, the bus will ask this node
+    /// what bit to send out of the (now encoded) frame (which is now a bitstream).
+    /// The node will push the encoded frame bits, bit-by-bit on every bus bit tick unless the node lost tranmission due to priority or an error occurs.
+    pub fn queue_transmission(
+        &mut self,
+        payload: Vec<u8>,
+        remote_request: bool,
+    ) -> Result<(), ProtiumFrameError> {
+        let frame = Frame::new(self.can_id, payload, remote_request)?;
         let stuffed = frame.encode_stuffed().inspect_err(|_| {
-            self.error(true);
-        })?;
-
-        let encoded = frame.encode().inspect_err(|_| {
             self.error(true);
         })?;
 
@@ -414,6 +422,7 @@ impl Node {
         });
 
         if rc_stream.stuffed_bits.is_empty() && bit {
+            self.idle();
             return;
         }
 
