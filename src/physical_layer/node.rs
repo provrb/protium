@@ -1,11 +1,14 @@
 use crate::{
     can::{
-        CanId, Frame, ProtiumFrameError, WireBits, WireLayout, IDENTIFIER_EXTENSION_BIT_IDX,
+        CanId,
+        ErrorFrameType::{self, Active, Passive},
+        Frame, ProtiumFrameError, WireBits, WireLayout, IDENTIFIER_EXTENSION_BIT_IDX,
         MAX_STUFFED_EXTENDED_FRAME_SIZE_BITS, MAX_UNSTUFFED_EXTENDED_FRAME_SIZE_BITS, SRR_BIT_IDX,
     },
-    printerr,
+    node::NodeState::ErrorHandling,
+    printerr, printwarn,
 };
-use bitvec::{field::BitField, order::Msb0, vec::BitVec};
+use bitvec::{bitvec, field::BitField, order::Msb0, vec::BitVec};
 use std::{cmp::Ordering, ops::Deref};
 use thiserror::Error;
 
@@ -79,7 +82,7 @@ pub enum NodeState {
     Sleeping,
     Transmitting,
     Receiving,
-    Error,
+    ErrorHandling,
 }
 
 /// A stream created when receiving a message from the bus
@@ -192,7 +195,7 @@ impl Node {
     /// An node is inactive if it is in the `BusOff` `ErrorState` or
     /// the node is in the `Sleeping` state
     pub fn is_active(&self) -> bool {
-        if self.state() == NodeState::Error && self.error_state() == NodeErrorState::BusOff
+        if self.state() == NodeState::ErrorHandling && self.error_state() == NodeErrorState::BusOff
             || self.state() == NodeState::Sleeping
         {
             // Node is not active
@@ -297,7 +300,7 @@ impl Node {
     ) -> Result<(), ProtiumFrameError> {
         let frame = Frame::new(self.can_id, payload, remote_request)?;
         let stuffed = frame.encode_stuffed().inspect_err(|_| {
-            self.error(true);
+            self.register_error(true);
         })?;
 
         let unstuffed_layout =
@@ -344,7 +347,25 @@ impl Node {
         });
 
         self.state = NodeState::Transmitting;
+
         Ok(())
+    }
+
+    pub fn queue_error_frame_transmission(&mut self, frame_type: ErrorFrameType) {
+        let error_frame: WireBits = match frame_type {
+            Active => bitvec![u8, Msb0; 0,0,0,0,0,0,1,1,1,1,1,1,1,1],
+            Passive => bitvec![u8, Msb0; 1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+        };
+
+        self.transmit_stream = Some(TransmitStream {
+            bits: error_frame,
+            ts_idx: 0,
+            ack_slot_stuffed_idx: 0,
+            ts_frame_layout: WireLayout::default(),
+            pending_retransmit: false,
+        });
+
+        self.set_transmitting();
     }
 
     pub fn pending_retransmission(&self) -> bool {
@@ -408,6 +429,10 @@ impl Node {
     }
 
     pub fn store_bit(&mut self, bit: bool) {
+        if self.state() == NodeState::ErrorHandling || self.state() == NodeState::Sleeping {
+            return;
+        }
+
         let rc_stream = self.receive_stream.get_or_insert(ReceiveStream {
             stuffed_bits: WireBits::with_capacity(MAX_STUFFED_EXTENDED_FRAME_SIZE_BITS),
             destuffed_bits: WireBits::with_capacity(MAX_UNSTUFFED_EXTENDED_FRAME_SIZE_BITS),
@@ -420,28 +445,64 @@ impl Node {
             frame_data_length: None,
             frame_layout: None,
         });
-
-        if rc_stream.stuffed_bits.is_empty() && bit {
-            self.idle();
+        
+        if (rc_stream.stuffed_bits.is_empty() || rc_stream.destuffed_bits.is_empty()) && bit {
+            self.set_idle();
             return;
         }
-
-        let prev_bit = rc_stream.stuffed_bits.last().map(|b| *b);
-        rc_stream.stuffed_bits.push(bit);
-        rc_stream.wire_idx += 1;
-
-        if Some(bit) == prev_bit {
-            rc_stream.consecutive_identical_bits += 1;
+        
+        let in_stuff_region = if let Some(layout) = rc_stream.frame_layout {
+            rc_stream.frame_idx <= layout.crc_field.end()
         } else {
-            if rc_stream.consecutive_identical_bits == 5 {
-                rc_stream.consecutive_identical_bits = 0;
+            true
+        };
+        
+        if in_stuff_region {
+            let prev_bit = rc_stream.stuffed_bits.last().map(|b| *b);
+            rc_stream.stuffed_bits.push(bit);
+            rc_stream.wire_idx += 1;
+
+            if Some(bit) == prev_bit {
+                rc_stream.consecutive_identical_bits += 1;
+            } else {
+                if rc_stream.consecutive_identical_bits == 5 {
+                    rc_stream.consecutive_identical_bits = 0;
+                    return;
+                }
+                rc_stream.consecutive_identical_bits = 1;
+            }
+
+            if rc_stream.consecutive_identical_bits > 5 {
+                self.receive_stream.take();
+                self.register_error(false);
                 return;
             }
-            rc_stream.consecutive_identical_bits = 1;
-        }
 
+        }
+        
         rc_stream.destuffed_bits.push(bit);
         rc_stream.frame_idx += 1;
+    }
+
+    pub fn register_error(&mut self, while_transmitting: bool) {
+        if while_transmitting {
+            self.transmit_error_counter += 1
+        } else {
+            self.receive_error_counter += 1
+        };
+
+        self.error_state = if self.transmit_error_counter < 128 && self.receive_error_counter < 128
+        {
+            NodeErrorState::Active
+        } else if self.transmit_error_counter >= 128 && self.receive_error_counter >= 128 {
+            NodeErrorState::Passive
+        } else if self.transmit_error_counter > 255 {
+            NodeErrorState::BusOff
+        } else {
+            NodeErrorState::None
+        };
+
+        self.state = ErrorHandling;
     }
 
     pub(crate) fn process_receive(&mut self) -> Result<(), ProtiumNodeError> {
@@ -628,25 +689,5 @@ impl Node {
         }
 
         Ok(())
-    }
-
-    pub(crate) fn error(&mut self, transmit_error: bool) {
-        if transmit_error {
-            self.transmit_error_counter += 1
-        } else {
-            self.receive_error_counter += 1
-        };
-
-        if self.transmit_error_counter < 128 && self.receive_error_counter < 128 {
-            self.error_state = NodeErrorState::Active;
-            // todo: send error frame
-        } else if self.transmit_error_counter >= 128 && self.receive_error_counter >= 128 {
-            self.error_state = NodeErrorState::Passive;
-            // todo: send error frame
-        } else if self.transmit_error_counter > 255 {
-            self.error_state = NodeErrorState::BusOff;
-        }
-
-        self.state = NodeState::Error;
     }
 }

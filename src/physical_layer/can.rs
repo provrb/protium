@@ -73,6 +73,12 @@ pub enum ProtiumFrameError {
     CorruptFieldInFrame,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ErrorFrameType {
+    Active,
+    Passive,
+}
+
 #[repr(u32)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum CanId {

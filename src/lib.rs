@@ -1,16 +1,16 @@
 mod logging;
 /// Modules
-mod protium_core;
+mod physical_layer;
 
 /// Imports
-pub use protium_core::*;
+pub use physical_layer::*;
 
 /// Unit tests
 #[cfg(test)]
 mod tests {
     use crate::{bit_destuff, bit_stuff, bus::Bus, node::Node};
 
-    use super::protium_core::can::*;
+    use super::physical_layer::can::*;
     use bitvec::{bitvec, order::Msb0, vec::BitVec};
 
     fn expected_bits(can_id: CanId, payload: Vec<u8>) -> BitVec<u8, Msb0> {

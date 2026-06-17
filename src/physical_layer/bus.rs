@@ -1,5 +1,5 @@
 use crate::{
-    can::{CAN_H, CAN_L, CanId},
+    can::{CanId, CAN_H, CAN_L},
     node::{Node, NodeState, ProtiumNodeError},
     printwarn,
 };
@@ -22,7 +22,7 @@ pub struct Bus {
 
     #[allow(dead_code)]
     /// RESERVED
-    baud_rate: u16, 
+    baud_rate: u16,
 }
 
 impl Bus {
@@ -157,7 +157,7 @@ impl Bus {
                     node.id(),
                     e
                 );
-                node.error(false);
+                node.register_error(false);
             }
 
             if node.state() == NodeState::Transmitting {
@@ -167,7 +167,7 @@ impl Bus {
                     if !node.pending_retransmission() {
                         node.queue_retransmission(true);
                     }
-                    node.error(true);                    
+                    node.register_error(true);             
                 } else {
                     if node.pending_retransmission() {
                         node.queue_retransmission(false);
