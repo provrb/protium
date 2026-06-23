@@ -1,16 +1,16 @@
 mod logging;
 /// Modules
-mod physical_layer;
+mod dll;
 
 /// Imports
-pub use physical_layer::*;
+pub use dll::*;
 
 /// Unit tests
 #[cfg(test)]
 mod tests {
     use crate::{bit_destuff, bit_stuff, bus::Bus, node::Node};
 
-    use super::physical_layer::can::*;
+    use super::dll::can::*;
     use bitvec::{bitvec, order::Msb0, vec::BitVec};
 
     fn expected_bits(can_id: CanId, payload: Vec<u8>) -> BitVec<u8, Msb0> {
